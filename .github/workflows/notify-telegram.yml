@@ -39,7 +39,6 @@ jobs:
           EVENT="${{ inputs.event_kind }}"
 
           # 커밋 정보
-          SHA_SHORT="$(git rev-parse --short=8 HEAD || true)"
           COMMIT_MSG="$(git log -1 --pretty=%s || true)"
           COMMITS_URL="https://github.com/${REPO}/commits/${REF}"
 
@@ -51,7 +50,7 @@ jobs:
                 Commit: \`${SHA_SHORT}\`
                 Message: ${TITLE}
               
-                🧾 [Recent Commits] ${COMMITS_URL}
+                ▶️ [Recent Commits] ${COMMITS_URL}
                 ▶️ [Workflow Run] ${RUN_URL}"
   
           elif [[ "$EVENT" == "pr" ]]; then
@@ -67,7 +66,7 @@ jobs:
               From: ${HEAD} → ${BASE}
               By: ${PR_USER}
                 
-              🧾 [PR] ${PR_URL}
+              ▶️ [PR] ${PR_URL}
               ▶️ [Workflow Run] ${RUN_URL}"
   
           else
@@ -83,7 +82,7 @@ jobs:
               From: ${HEAD} → ${BASE}
               Merged By: ${MERGER}
               
-              🧾 [PR] ${PR_URL}
+              ▶️ [PR] ${PR_URL}
               ▶️ [Workflow Run] ${RUN_URL}"
           fi
         
