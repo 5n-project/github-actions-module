@@ -3,16 +3,19 @@ description: "Send a Telegram message"
 inputs:
   bot_token:
     required: true
+    description: "telegram bot token"
   chat_id:
     required: true
+    description: "telegram chat room id"
   message:
     required: true
+    description: "telegram message"
 runs:
   using: "composite"
   steps:
     - shell: bash
       run: |
         set -e
-        curl -sS -X POST "https://api.telegram.org/bot${{ inputs.token }}/sendMessage" \
-          -d chat_id="${{ inputs.to }}" \
+        curl -sS -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendMessage" \
+          -d chat_id="${{ inputs.chat_id }}" \
           --data-urlencode text="${{ inputs.message }}"

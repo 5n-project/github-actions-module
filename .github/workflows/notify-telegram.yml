@@ -24,7 +24,7 @@ jobs:
         with:
           repository: ${{ github.repository }}
           ref: ${{ github.sha }}
-          fetch-depth: 2
+          fetch-depth: 0
 
       - name: Build unified message from caller context
         id: msg
@@ -39,16 +39,18 @@ jobs:
           # 커밋 정보
           SHA_SHORT="$(git rev-parse --short=8 HEAD || true)"
           COMMIT_MSG="$(git log -1 --pretty=%s || true)"
+          COMMITS_URL="https://github.com/${REPO}/commits
 
           if [[ "$EVENT" == "push" ]]; then
             TITLE="${COMMIT_MSG:-${{ github.event.head_commit.message || '' }}}"
-            MSG="🔔 *PUSH to ${REF}*
-                *Repo*: ${REPO}
-                *By*: ${ACTOR}
-                *Commit*: \`${SHA_SHORT}\`
-                *Message*: ${TITLE}
+            MSG="🔔 * PUSH to ${REF} *
+                Repo: ${REPO}
+                By: ${ACTOR}
+                Commit: \`${SHA_SHORT}\`
+                Message: ${TITLE}
               
-                ▶️ [Workflow Run](${RUN_URL})"
+                🧾 [Recent Commits] ${COMMITS_URL}
+                ▶️ [Workflow Run] ${RUN_URL}"
   
           elif [[ "$EVENT" == "pr" ]]; then
           PR_NUM="${{ github.event.pull_request.number }}"
@@ -57,14 +59,14 @@ jobs:
           PR_URL="${{ github.event.pull_request.html_url }}"
           BASE="${{ github.event.pull_request.base.ref }}"
           HEAD="${{ github.event.pull_request.head.ref }}"
-          MSG="🧩 *PR to ${BASE}*
-              *Repo*: ${REPO}
-              *PR*: #${PR_NUM} - ${PR_TITLE}
-              *From*: ${HEAD} → ${BASE}
-              *By*: ${PR_USER}
+          MSG="🧩 * PR to ${BASE} *
+              Repo: ${REPO}
+              PR: #${PR_NUM} - ${PR_TITLE}
+              From: ${HEAD} → ${BASE}
+              By: ${PR_USER}
                 
-              🔗 ${PR_URL}
-              ▶️ [Workflow Run](${RUN_URL})"
+              🧾 [PR] ${PR_URL}
+              ▶️ [Workflow Run] ${RUN_URL}"
   
           else
           PR_NUM="${{ github.event.pull_request.number }}"
@@ -73,13 +75,13 @@ jobs:
           PR_URL="${{ github.event.pull_request.html_url }}"
           BASE="${{ github.event.pull_request.base.ref }}"
           HEAD="${{ github.event.pull_request.head.ref }}"
-          MSG="✅ *MERGED into ${BASE}*
-              *Repo*: ${REPO}
-              *PR*: #${PR_NUM} - ${PR_TITLE}
-              *From*: ${HEAD} → ${BASE}
-              *Merged By*: ${MERGER}
+          MSG="✅ * MERGED into ${BASE} *
+              Repo: ${REPO}
+              PR: #${PR_NUM} - ${PR_TITLE}
+              From: ${HEAD} → ${BASE}
+              Merged By: ${MERGER}
               
-              🔗 ${PR_URL}
+              🧾 [PR] ${PR_URL}
               ▶️ [Workflow Run](${RUN_URL})"
           fi
         
@@ -88,7 +90,7 @@ jobs:
             echo "${MSG}"
                     echo "EOF"
           } >> "$GITHUB_OUTPUT"
-  
+
       - name: Decide chat target by event_kind
         id: route
         shell: bash
@@ -111,6 +113,6 @@ jobs:
       - name: Send Telegram
         uses: 5n-project/github-actions-module/actions/notify-telegram@v1
         with:
-          token: ${{ secrets.TELEGRAM_TOKEN }}
-          to: ${{ steps.route.outputs.to }}   # ✅ 이벤트별 방으로 라우팅됨
+          bot_token: ${{ secrets.TELEGRAM_TOKEN }}
+          chat_id: ${{ steps.route.outputs.to }}
           message: ${{ steps.msg.outputs.text }}
