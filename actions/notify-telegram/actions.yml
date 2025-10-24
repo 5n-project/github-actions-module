@@ -1,0 +1,18 @@
+name: Notify Telegram
+description: "Send a Telegram message"
+inputs:
+  bot_token:
+    required: true
+  chat_id:
+    required: true
+  message:
+    required: true
+runs:
+  using: "composite"
+  steps:
+    - shell: bash
+      run: |
+        set -e
+        curl -sS -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendMessage" \
+          -d chat_id="${{ inputs.chat_id }}" \
+          --data-urlencode text="${{ inputs.message }}"
