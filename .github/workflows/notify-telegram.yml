@@ -18,7 +18,6 @@ jobs:
   format_and_send:
     runs-on: ubuntu-latest
     steps:
-      # 콜러(도메인) 레포의 git 히스토리를 안전하게 사용
       - name: Checkout caller repo
         uses: actions/checkout@v4
         with:
@@ -47,7 +46,6 @@ jobs:
             MSG="🔔 * PUSH to ${REF} *
                 Repo: ${REPO}
                 By: ${ACTOR}
-                Commit: \`${SHA_SHORT}\`
                 Message: ${TITLE}
               
                 ▶️ [Recent Commits] ${COMMITS_URL}
