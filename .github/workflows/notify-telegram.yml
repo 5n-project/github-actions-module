@@ -30,6 +30,8 @@ jobs:
         id: msg
         shell: bash
         run: |
+          set -euo pipefail
+          
           REPO="${{ github.repository }}"
           ACTOR="${{ github.actor }}"
           REF="${{ github.ref_name }}"
@@ -39,7 +41,7 @@ jobs:
           # 커밋 정보
           SHA_SHORT="$(git rev-parse --short=8 HEAD || true)"
           COMMIT_MSG="$(git log -1 --pretty=%s || true)"
-          COMMITS_URL="https://github.com/${REPO}/commits
+          COMMITS_URL="https://github.com/${REPO}/commits/${REF}"
 
           if [[ "$EVENT" == "push" ]]; then
             TITLE="${COMMIT_MSG:-${{ github.event.head_commit.message || '' }}}"
@@ -82,13 +84,13 @@ jobs:
               Merged By: ${MERGER}
               
               🧾 [PR] ${PR_URL}
-              ▶️ [Workflow Run](${RUN_URL})"
+              ▶️ [Workflow Run] ${RUN_URL}"
           fi
         
           {
             echo "text<<EOF"
             echo "${MSG}"
-                    echo "EOF"
+            echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
       - name: Decide chat target by event_kind
