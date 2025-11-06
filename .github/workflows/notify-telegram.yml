@@ -11,7 +11,7 @@ on:
         description: "project/service name (deploy 전송용)"
         required: false
         type: string
-      env:
+      environment:
         description: "environment (dev|stg|prod 등, deploy 전송용)"
         required: false
         type: string
@@ -55,7 +55,7 @@ jobs:
           
           if [[ "$EVENT" == "deploy" ]]; then
             PROJECT="${{ inputs.project }}"
-            ENVNAME="${{ inputs.env }}"
+            ENVNAME="${{ inputs.environment }}"
             RESULT="${{ inputs.result }}"
             IMAGE="${{ inputs.image }}"
             TAG="${{ inputs.tag }}"
