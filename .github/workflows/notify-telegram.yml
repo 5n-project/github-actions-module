@@ -4,8 +4,20 @@ on:
   workflow_call:
     inputs:
       event_kind:
-        description: "push | pr | merge"
+        description: "push | pr | merge | deploy"
         required: true
+        type: string
+      project:
+        description: "project/service name (deploy 전송용)"
+        required: false
+        type: string
+      env:
+        description: "environment (dev|stg|prod 등, deploy 전송용)"
+        required: false
+        type: string
+      result:
+        description: "deploy result (success|failure, deploy 전송용)"
+        required: false
         type: string
     secrets:
       TELEGRAM_TOKEN:        { required: true }
@@ -25,7 +37,7 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
-      - name: Build unified message from caller context
+      - name: Build unified message
         id: msg
         shell: bash
         run: |
@@ -40,6 +52,32 @@ jobs:
           # 커밋 정보
           COMMIT_MSG="$(git log -1 --pretty=%s || true)"
           COMMITS_URL="https://github.com/${REPO}/commits/${REF}"
+          
+          if [[ "$EVENT" == "deploy" ]]; then
+            PROJECT="${{ inputs.project }}"
+            ENVNAME="${{ inputs.env }}"
+            RESULT="${{ inputs.result }}"
+            IMAGE="${{ inputs.image }}"
+            TAG="${{ inputs.tag }}"
+
+            # 이모지/라벨
+            if [[ "${RESULT}" == "success" ]]; then
+              ICON="✅"; RESULT_UPPER="SUCCESS"
+            else
+              ICON="❌"; RESULT_UPPER="FAILED"
+            fi
+
+            # 메시지 조립
+            MSG="${ICON} *DEPLOY ${RESULT_UPPER}*
+                  Project: ${PROJECT}
+                  Env:     ${ENVNAME}"
+                    [[ -n "${TAG}"   ]] && MSG="${MSG}
+                  Tag:     ${TAG}"
+                    [[ -n "${IMAGE}" ]] && MSG="${MSG}
+                  Image:   ${IMAGE}"
+                    MSG="${MSG}
+                  
+                  ▶️ Workflow Run: ${RUN_URL}"
 
           if [[ "$EVENT" == "push" ]]; then
             TITLE="${COMMIT_MSG:-${{ github.event.head_commit.message || '' }}}"
@@ -94,19 +132,18 @@ jobs:
         id: route
         shell: bash
         run: |
+          set -euo pipefail
           EVENT="${{ inputs.event_kind }}"
           TO_DEFAULT="${{ secrets.TELEGRAM_TO }}"
-          TO_PUSH="${{ secrets.TELEGRAM_TO_PUSH }}"
-          TO_PR="${{ secrets.TELEGRAM_TO_PR }}"
-          TO_MERGE="${{ secrets.TELEGRAM_TO_MERGE }}"
-      
           case "$EVENT" in
-            push)  TO="${TO_PUSH:-$TO_DEFAULT}" ;;
-            pr)    TO="${TO_PR:-$TO_DEFAULT}" ;;
-            merge) TO="${TO_MERGE:-$TO_DEFAULT}" ;;
-            *)     TO="$TO_DEFAULT" ;;
+            push)   TO="${{ secrets.TELEGRAM_TO_PUSH }}"   ;;
+            pr)     TO="${{ secrets.TELEGRAM_TO_PR }}"     ;;
+            merge)  TO="${{ secrets.TELEGRAM_TO_MERGE }}"  ;;
+            deploy) TO="${{ secrets.TELEGRAM_TO_DEPLOY }}" ;;
+            *)      TO="" ;;
           esac
-      
+          
+          [[ -z "$TO" ]] && TO="$TO_DEFAULT"
           echo "to=$TO" >> "$GITHUB_OUTPUT"
 
       - name: Send Telegram
