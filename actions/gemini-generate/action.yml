@@ -27,6 +27,14 @@ inputs:
   max_output_tokens:
     required: false
     default: "2048"
+  thinking_budget:
+    description: >-
+      generationConfig.thinkingConfig.thinkingBudget. 비우면 보내지 않는다(모델 기본값).
+      2.5 계열은 thinking 모델이고 사고 토큰이 max_output_tokens 예산을 함께 소비한다.
+      입력이 크고 지시가 복잡하면 사고에 예산을 다 써서 본문이 MAX_TOKENS 로 잘릴 수 있다.
+      "0" = 사고 비활성, "-1" = 동적, 양수 = 사고 토큰 상한.
+    required: false
+    default: ""
   max_time:
     description: >-
       curl --max-time (초). 요청 1회의 전체 상한.
@@ -72,6 +80,7 @@ runs:
         CONTENT_FILE: ${{ inputs.content_file }}
         TEMPERATURE: ${{ inputs.temperature }}
         MAX_OUTPUT_TOKENS: ${{ inputs.max_output_tokens }}
+        THINKING_BUDGET: ${{ inputs.thinking_budget }}
         MAX_TIME: ${{ inputs.max_time }}
         RETRY: ${{ inputs.retry }}
         SYSTEM_INSTRUCTION: ${{ inputs.system_instruction }}
@@ -149,6 +158,14 @@ runs:
             }' > "${body_path}"
         fi
 
+        # thinkingBudget 은 지정했을 때만 실어보낸다 (미지정 = 모델 기본값)
+        if [ -n "${THINKING_BUDGET}" ]; then
+          jq --argjson tb "${THINKING_BUDGET}" \
+            '.generationConfig.thinkingConfig = { thinkingBudget: $tb }' \
+            "${body_path}" > "${body_path}.tmp"
+          mv "${body_path}.tmp" "${body_path}"
+        fi
+
         # =========
         # 3) HTTP request (network/timeout/status) hardening
         #    body 는 --data-binary @file 로 전송한다
@@ -217,7 +234,15 @@ runs:
         fi
 
         # =========
-        # 5) Result validation (empty candidates/text) + parts join
+        # 5) Usage / finishReason 진단
+        #    사고 토큰(thoughts)도 maxOutputTokens 예산을 함께 쓴다.
+        #    잘림을 눈으로 잡을 수 있게 항상 남긴다.
+        # =========
+        finish_reason="$(jq -r '.candidates[0].finishReason // empty' "${resp_path}")"
+        echo "finishReason=${finish_reason:-<none>} | tokens: prompt=$(jq -r '.usageMetadata.promptTokenCount // 0' "${resp_path}") output=$(jq -r '.usageMetadata.candidatesTokenCount // 0' "${resp_path}") thoughts=$(jq -r '.usageMetadata.thoughtsTokenCount // 0' "${resp_path}") total=$(jq -r '.usageMetadata.totalTokenCount // 0' "${resp_path}") | maxOutputTokens=${MAX_OUTPUT_TOKENS} thinkingBudget=${THINKING_BUDGET:-<default>}"
+
+        # =========
+        # 6) Result validation (empty candidates/text) + parts join
         # =========
         jq -r '
           (.candidates // []) as $c
@@ -230,12 +255,22 @@ runs:
 
         # jq -r 은 빈 문자열에도 개행 1바이트를 남긴다 -> 1바이트 이하면 빈 응답
         if [ "$(wc -c < "${text_path}")" -le 1 ]; then
-          finish_reason="$(jq -r '.candidates[0].finishReason // empty' "${resp_path}")"
           echo "::error::Gemini returned empty text. finishReason=${finish_reason}. Raw: $(head -c 2000 "${resp_path}")"
           exit 1
         fi
 
         echo "text=$(wc -c < "${text_path}") bytes"
+
+        # =========
+        # 7) 잘림 가드
+        #    finishReason 이 STOP 이 아니면 본문이 중간에 끊긴 것이다.
+        #    (MAX_TOKENS / SAFETY / RECITATION 등)
+        #    이걸 통과시키면 잘린 릴리즈 노트가 성공으로 Notion 까지 올라간다.
+        # =========
+        if [ -n "${finish_reason}" ] && [ "${finish_reason}" != "STOP" ]; then
+          echo "::error::Gemini response is incomplete: finishReason=${finish_reason} (text=$(wc -c < "${text_path}") bytes). MAX_TOKENS 이면 max_output_tokens 를 올리거나 thinking_budget 으로 사고 토큰을 제한하거나 입력을 줄여야 한다. 사고 토큰도 max_output_tokens 예산을 함께 쓴다."
+          exit 1
+        fi
 
         # =========
         # 6) Output
