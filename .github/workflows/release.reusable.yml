@@ -19,11 +19,12 @@ on:
       compact_batch_size:
         type: string
         required: false
-        default: "80"
+        default: "150"
         description: >-
           PASS 1(커밋 메시지 정제) 배치 1건에 담을 커밋 수.
           한 번의 Gemini 호출로 처리할 수 있는 출력 분량을 넘기지 않도록 나누는 단위다.
-          커밋당 출력이 약 160~200 토큰이므로 80이면 배치당 약 16K 토큰이다.
+          실측 커밋당 출력 약 104 토큰. 150이면 배치당 약 16K 토큰으로, 본문 예산(약 57K)에
+          3배 이상 여유가 있다. 값을 줄이면 호출 수가 늘어 무료 티어 분당 한도에 닿기 쉽다.
 
       # =========================
       # Runtime (caller -> reusable)

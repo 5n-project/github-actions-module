@@ -60,9 +60,10 @@ inputs:
     default: "3"
   quota_retry:
     description: >-
-      429(rate limit / quota) 재시도 횟수. curl 의 지수 백오프로는 못 넘기는 케이스다 —
-      무료 티어 분당 한도는 "35초 뒤 재시도" 수준을 요구한다.
-      응답의 RetryInfo.retryDelay 를 읽어 그만큼(5~180초) 기다린 뒤 재시도한다.
+      429(rate limit / quota) · 503(모델 과부하) 재시도 횟수.
+      둘 다 curl 의 지수 백오프로는 못 넘기는 케이스다 — 무료 티어 분당 한도는
+      "35초 뒤 재시도"를 요구하고, 503 스파이크도 수십 초 단위 대기가 필요하다.
+      429 는 응답의 RetryInfo.retryDelay 를, 503 은 기본값을 써서 5~180초 기다린 뒤 재시도한다.
     required: false
     default: "3"
   system_instruction:
@@ -215,11 +216,13 @@ runs:
               return 1
             fi
 
-            # 429 = rate limit / quota.
-            # curl --retry 의 지수 백오프(1s, 2s, 4s ...)로는 못 넘긴다 —
-            # 무료 티어 분당 한도는 "35초 뒤 재시도" 수준을 요구한다.
-            # 응답의 RetryInfo.retryDelay(없으면 message 의 "retry in Ns")를 읽어 그만큼 기다린다.
-            if [ "${http_code}" = "429" ] && [ "${attempt}" -lt "${max_attempts}" ]; then
+            # 429 = rate limit / quota, 503 = 모델 과부하.
+            # 둘 다 curl --retry 의 지수 백오프(1s, 2s, 4s ...)로는 못 넘긴다 —
+            # 무료 티어 분당 한도는 "35초 뒤 재시도"를 요구하고, 503 스파이크도
+            # 47초 안에 4번 두드려서는 안 풀린다. 수십 초 단위로 기다려야 한다.
+            # 429 는 응답의 RetryInfo.retryDelay(없으면 message 의 "retry in Ns")를 따르고,
+            # 503 은 그런 정보가 없으므로 기본 대기값을 쓴다.
+            if { [ "${http_code}" = "429" ] || [ "${http_code}" = "503" ]; } && [ "${attempt}" -lt "${max_attempts}" ]; then
               wait_s="$(jq -r '
                 [ .error.details[]? | select((.["@type"] // "") | test("RetryInfo")) | .retryDelay ]
                 | first // ""
@@ -235,7 +238,7 @@ runs:
               [ "${wait_s}" -lt 5 ] && wait_s=5
               [ "${wait_s}" -gt 180 ] && wait_s=180
               wait_s=$((wait_s + 2))   # 서버 기준시간과의 오차 여유
-              echo "::warning::${label}: HTTP 429 (quota/rate limit). ${wait_s}s 대기 후 재시도 (${attempt}/${max_attempts})"
+              echo "::warning::${label}: HTTP ${http_code} ($([ "${http_code}" = "429" ] && echo 'quota/rate limit' || echo 'model overload')). ${wait_s}s 대기 후 재시도 (${attempt}/${max_attempts})"
               sleep "${wait_s}"
               continue
             fi

@@ -42,9 +42,10 @@ Caller에서:
 * `manifest_dir` (string, default: `releases`)
 
   * 현재 워크플로에서는 **YML 파일을 생성하지 않음**. (입력 정의는 유지)
-* `compact_batch_size` (string, default: `"80"`)
+* `compact_batch_size` (string, default: `"150"`)
   PASS 1(커밋 메시지 정제) 배치 1건에 담을 커밋 수.
-  커밋당 출력이 약 160~200 토큰이므로 80이면 배치당 약 16K 토큰이다.
+  실측 커밋당 출력 약 104 토큰. 150이면 배치당 약 16K 토큰으로 본문 예산(약 57K)에 3배 이상 여유가 있다.
+  값을 줄이면 호출 수가 늘어 무료 티어 분당 한도(429)에 닿기 쉽다.
   아래 “출력 상한과 2-pass” 참고.
 * `current_tags` (string, default: `""`)
   선택된 서비스들의 현재 배포 버전 매핑. 사실상 필수값.
@@ -206,7 +207,7 @@ PASS 2 는 **caller 의 기존 프롬프트를 그대로** 쓴다. 입력만 원
 바뀌므로 문서 병합 파서가 필요 없고 Summary 도 한 문서 안에서 생성된다.
 `release-notes.compact.md` 를 두지 않은 caller 는 워크플로 내장 기본 프롬프트로 동작한다.
 
-실측(커밋 322개 · draft 475,771 bytes · `compact_batch_size: 80`):
+실측(커밋 322개 · draft 475,771 bytes · `compact_batch_size: 80`(당시 기본값)):
 
 * PASS 1: 5회 호출, 전부 `finishReason=STOP`, 출력 합계 95,783 bytes (draft 대비 80% 압축)
 * PASS 2: prompt 31,446 · 본문 13,792 · 사고 12,284 = 57,522 / 65,535 → `STOP`

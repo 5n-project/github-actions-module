@@ -305,3 +305,30 @@ DELIM="__EOF_$(date +%s%N)__"
   * 모델/응답 포맷이 바뀌면 보강 필요.
 * 작업 파일은 `$RUNNER_TEMP` 하위이므로 **같은 job 내 스텝 간에만** 공유된다.
   job 이 다르면 artifact 등 다른 수단이 필요하다.
+
+---
+
+## 429 / 503 재시도 (`quota_retry`)
+
+`curl --retry` 의 지수 백오프(1s, 2s, 4s …)는 8초 안에 소진되어 아래 두 케이스를 못 넘긴다.
+
+* **429** — 무료 티어 분당 한도. 응답이 `"Please retry in 35.18s"` 수준을 요구한다
+* **503** — 모델 과부하 스파이크. 47초 안에 4번 두드려서는 풀리지 않는다
+
+그래서 별도 루프로 **수십 초 단위** 재시도를 한다.
+
+* 429: 응답 `error.details[]` 의 `RetryInfo.retryDelay` → 없으면 `message` 의
+  `"retry in Ns"` → 없으면 30초
+* 503: 기본 30초
+* 5~180초로 묶고 서버 기준시간 오차 여유 2초를 더한다
+* 횟수는 `quota_retry` (기본 3회)
+
+로그:
+
+```
+##[warning]batch batch_001.md: HTTP 429 (quota/rate limit). 37s 대기 후 재시도 (1/4)
+##[warning]batch batch_001.md: HTTP 503 (model overload). 32s 대기 후 재시도 (2/4)
+```
+
+배치 모드는 호출 수가 배치 수만큼 늘어난다. 무료 티어에서는 호출 수를 줄이는 편이
+안전하다 (워크플로 쪽 `compact_batch_size` 를 키운다).
