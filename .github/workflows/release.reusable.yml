@@ -1323,11 +1323,27 @@ jobs:
             def reset_list_state():
               last_list_at.clear()
 
+            # LLM 출력의 들여쓰기 단위를 고정하지 않고 감지한다.
+            # 프롬프트로 "4스페이스"를 지시해도 모델이 입력(압축본은 2스페이스)을
+            # 따라 2스페이스로 내보내는 경우가 실제로 있었고, 그러면 4스페이스 기준
+            # 파서가 전부 레벨 0으로 읽어 계층이 통째로 평탄해진다.
+            # 실제로 등장한 최소 양수 들여쓰기를 1레벨로 본다 (없으면 4).
+            _indent_re = re.compile(r"^([ \t]+)(?:[-*]|\d+[.)])\s+\S")
+            _widths = set()
+            for _raw in lines2:
+              _m = _indent_re.match(_raw.rstrip("\n"))
+              if _m:
+                _widths.add(len(_m.group(1).replace("\t", " " * 4)))
+            MD_INDENT_UNIT = min(_widths) if _widths else 4
+            if MD_INDENT_UNIT <= 0:
+              MD_INDENT_UNIT = 4
+            print(f"release notes indent unit = {MD_INDENT_UNIT} (observed widths: {sorted(_widths)})")
+
             def md_level(prefix: str) -> int:
               """
               들여쓰기 레벨 계산 (유니코드 공백 포함 + 탭 지원)
               - 탭 1개 = 1레벨
-              - 공백류(isspace) 4개 = 1레벨
+              - 공백류(isspace) MD_INDENT_UNIT 개 = 1레벨 (감지값)
               """
               if not prefix:
                 return 0
@@ -1340,7 +1356,7 @@ jobs:
                   continue
                 if ch.isspace():
                   space_run += 1
-                  if space_run >= 4:
+                  if space_run >= MD_INDENT_UNIT:
                     lvl += 1
                     space_run = 0
                   continue
