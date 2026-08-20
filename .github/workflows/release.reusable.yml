@@ -16,6 +16,14 @@ on:
         required: false
         default: releases
         description: "릴리즈 manifest 폴더 (e.g. releases)"
+      compact_batch_size:
+        type: string
+        required: false
+        default: "80"
+        description: >-
+          PASS 1(커밋 메시지 정제) 배치 1건에 담을 커밋 수.
+          한 번의 Gemini 호출로 처리할 수 있는 출력 분량을 넘기지 않도록 나누는 단위다.
+          커밋당 출력이 약 160~200 토큰이므로 80이면 배치당 약 16K 토큰이다.
 
       # =========================
       # Runtime (caller -> reusable)
@@ -681,13 +689,181 @@ jobs:
         if: steps.build_draft.outputs.has_commits != 'true'
         run: exit 1
 
-      - name: Build Gemini content
-        id: prompt
+      # =========================================================
+      # PASS 1 — 커밋 메시지 정제 (배치)
+      #
+      # draft 를 한 번에 넘기면 출력이 모델 상한을 넘는다. 실측(커밋 325개):
+      #   thinkingBudget 기본  : 사고 46,554 + 본문  3,442 = 49,996 / 50,000  -> 잘림
+      #   thinkingBudget 16384 : 사고 16,383 + 본문 33,613 = 49,996 / 50,000  -> 잘림
+      #   thinkingBudget 12288 : 사고 12,285 + 본문 53,246 = 65,531 / 65,535  -> 잘림
+      # 65,535 는 모델 출력 상한이라 더 올릴 수 없다. 출력 분량이 커밋 수에
+      # 비례하므로, 커밋을 배치로 나눠 "커밋당 몇 줄"로 먼저 압축한다.
+      #
+      # PASS 1 은 커밋 제목을 원문 그대로 남긴다. PASS 2 의 그룹 매핑이 제목
+      # prefix(`[Scope]` / `type(scope):`)에 의존하기 때문이다.
+      # =========================================================
+      - name: Build compact batches (pass 1 input)
+        id: batches
         shell: bash
         if: ${{ steps.build_draft.outputs.has_commits == 'true' }}
         env:
           # 본문이 아니라 경로만 넘긴다 (draft 는 100KB 이상 -> env 로는 E2BIG)
           DRAFT_FILE: ${{ steps.build_draft.outputs.draft_file }}
+          PROMPTS_DIR: ${{ inputs.prompts_dir }}
+          BATCH_SIZE: ${{ inputs.compact_batch_size }}
+        run: |
+          set -euo pipefail
+
+          export BATCH_DIR="${RUNNER_TEMP}/gemini_batches"
+          export COMPACT_SYSTEM_FILE="${RUNNER_TEMP}/gemini_compact_system.md"
+          rm -rf "${BATCH_DIR}"
+          mkdir -p "${BATCH_DIR}"
+
+          # caller 가 프롬프트를 두면 그것을 쓰고, 없으면 아래 기본값을 쓴다.
+          # 기존 caller(프론트 리포 등)는 파일 추가 없이 그대로 동작한다.
+          cat > "${RUNNER_TEMP}/compact_default.md" <<'DEFAULT_PROMPT'
+          You are a “Commit Message Compactor”.
+
+          You receive a list of raw commit entries. Each entry is a top-level bullet
+          (the commit subject, ending with "(<hash>)") optionally followed by indented
+          sub-bullets (the commit body).
+
+          Output the SAME list, compacted. Nothing else — no preamble, no headings of
+          your own, no explanation.
+
+          RULES
+          1) Keep every `## Section` line you receive, exactly as-is, in the same order.
+          2) Keep every commit. Never drop a commit entry.
+          3) Keep each commit's SUBJECT LINE VERBATIM, including its prefix
+             (`[Scope] ...` or `type(scope): ...`) and the trailing "(<hash>)".
+             Downstream grouping depends on that prefix. Do not translate or reword it.
+          4) Compact the BODY only:
+              - keep at most 3 sub-bullets per commit, one short line each,
+                describing observable behavior or scope
+              - indent sub-bullets by exactly 2 spaces, one level only
+              - if nothing meaningful remains, output the subject line alone
+          5) DROP these from the body entirely — they are internal process records:
+              - verification/process lines: "V0:", "V1:", "V1.5", "V2", "solo · k=",
+                "MEAS-", "PROD-N 관측", "회귀", "green", "0실패", "BUILD SUCCESSFUL",
+                test counts and run times
+              - reference lines: anything starting with "Refs:", and ticket IDs
+                ("DEALER-C3", "UC1".."UC16", "OI-C4", "KYORUGI-54", "PROD-7", "A9/B7")
+              - observation/defect notes: lines starting with "⚠", "결함 단정·수정 아님",
+                "후속 확인 대상", "— ISSUES/PROD 후보로 기록"
+              - implementation identifiers: class/file/method/package/annotation/
+                migration names, e.g. "BaseRepositoryTestConfig", "@DataJpaTest",
+                "order.draft.repository.jpa", "V80", "data.sql", "updateItems"
+              - enumerated internal test cases (lines starting with "·")
+              - meta-commentary about the commit itself: "additive·기존 무손상",
+                "프로덕션 변경 없음", "행위 보존 확인", "조각 N"
+          6) A body line that is a WRAPPED CONTINUATION of the previous bullet must be
+             joined back to it, never emitted as its own bullet. The input indentation
+             is produced by a heuristic, so a wrapped line can look one level deeper
+             than it is.
+          7) Do not invent facts. You may reword and shorten; you may not add any
+             change, cause or effect the entry does not state.
+
+          If a commit subject already starts with a bracket prefix (`[Scope] ...`), it was
+          hand-written and is already concise: keep its sub-bullets as they are (only
+          re-indent to 2 spaces and flatten deeper levels), and do not apply rule 5 to it.
+          DEFAULT_PROMPT
+
+          if [ -f "${PROMPTS_DIR}/gemini/release-notes.compact.md" ]; then
+            cp "${PROMPTS_DIR}/gemini/release-notes.compact.md" "${COMPACT_SYSTEM_FILE}"
+            echo "compact prompt: ${PROMPTS_DIR}/gemini/release-notes.compact.md (caller)"
+          else
+            cp "${RUNNER_TEMP}/compact_default.md" "${COMPACT_SYSTEM_FILE}"
+            echo "compact prompt: built-in default (caller 가 prompts/gemini/release-notes.compact.md 를 두면 그것을 쓴다)"
+          fi
+
+          python - <<'PY'
+          import os, re
+          from pathlib import Path
+
+          draft = Path(os.environ["DRAFT_FILE"]).read_text(encoding="utf-8")
+          batch_dir = Path(os.environ["BATCH_DIR"])
+          try:
+            batch_size = int(os.environ.get("BATCH_SIZE") or "80")
+          except ValueError:
+            batch_size = 80
+          if batch_size <= 0:
+            batch_size = 80
+
+          section_re = re.compile(r"^## (.+)$")
+          commit_re = re.compile(r"^- .+\([0-9a-f]{7,}\)\s*$")
+
+          # draft 를 (섹션, 커밋 블록) 단위로 쪼갠다.
+          # 커밋 블록 = 커밋 제목 줄 + 뒤따르는 들여쓴 본문 줄 전체
+          units = []          # [(section, [lines])]
+          section = None
+          cur = None
+          for line in draft.splitlines():
+            m = section_re.match(line)
+            if m:
+              section = m.group(1).strip()
+              cur = None
+              continue
+            if commit_re.match(line):
+              cur = [line]
+              units.append((section, cur))
+              continue
+            if cur is not None and (line.startswith(" ") or line.startswith("\t")) and line.strip():
+              cur.append(line)
+              continue
+            cur = None
+
+          total = len(units)
+          batches = [units[i:i + batch_size] for i in range(0, total, batch_size)] or [[]]
+
+          for idx, batch in enumerate(batches, start=1):
+            out, last_section = [], None
+            for sec, lines in batch:
+              if sec != last_section:
+                out.append(f"## {sec}")
+                last_section = sec
+              out.extend(lines)
+            path = batch_dir / f"batch_{idx:03d}.md"
+            path.write_text("\n".join(out) + "\n", encoding="utf-8")
+            print(f"  {path.name}: commits={len(batch)} {path.stat().st_size} bytes")
+
+          print(f"commits={total} batch_size={batch_size} batches={len(batches)}")
+          Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8").write(
+            f"batch_count={len(batches)}\ncommit_count={total}\n"
+          )
+          PY
+
+          {
+            echo "batch_dir=$BATCH_DIR"
+            echo "compact_system_file=$COMPACT_SYSTEM_FILE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Gemini compact (pass 1)
+        id: compact
+        if: ${{ steps.batches.outputs.batch_dir != '' }}
+        uses: KPNP-R-D/github-actions-module/actions/gemini-generate@gemini-generate/v1
+        with:
+          api_key: ${{ secrets.GEMINI_API_KEY }}
+          model: gemini-2.5-flash
+          temperature: 0.1
+          # 배치 1건 = 커밋 80개 -> 출력 약 8~15K 토큰. 상한에 여유가 크다.
+          max_output_tokens: 65535
+          thinking_budget: "8192"
+          max_time: "600"
+          retry: "3"
+          system_instruction_file: ${{ steps.batches.outputs.compact_system_file }}
+          content_dir: ${{ steps.batches.outputs.batch_dir }}
+
+      # =========================================================
+      # PASS 2 — 정제된 커밋 목록으로 릴리즈 노트 문서 1개 생성
+      # caller 의 기존 프롬프트(release-notes.system.md / input.md / template.md)를
+      # 그대로 쓴다. 입력만 원본 draft 대신 압축본으로 바뀐다.
+      # =========================================================
+      - name: Build Gemini content (pass 2)
+        id: prompt
+        shell: bash
+        if: ${{ steps.compact.outputs.text_dir != '' }}
+        env:
+          COMPACT_DIR: ${{ steps.compact.outputs.text_dir }}
           PROMPTS_DIR: ${{ inputs.prompts_dir }}
         run: |
           set -euo pipefail
@@ -705,16 +881,17 @@ jobs:
           input_md = (prompts_dir / "gemini/release-notes.input.md").read_text(encoding="utf-8")
           template = (prompts_dir / "release-notes.template.md").read_text(encoding="utf-8")
 
-          draft_file = os.environ.get("DRAFT_FILE") or ""
-          commits = Path(draft_file).read_text(encoding="utf-8") if draft_file and os.path.isfile(draft_file) else ""
+          # 배치 출력물을 순서대로 이어붙인다 (batch_001, batch_002, ...)
+          compact_dir = Path(os.environ["COMPACT_DIR"])
+          parts = [p.read_text(encoding="utf-8").strip() for p in sorted(compact_dir.iterdir()) if p.is_file()]
+          commits = "\n".join(p for p in parts if p)
 
           content = (input_md
             .replace("{{TEMPLATE}}", template)
             .replace("{{COMMITS}}", commits)
           )
 
-          # prompt/content 는 GITHUB_OUTPUT 이 아니라 파일로 넘긴다.
-          # (content = 프롬프트 + 커밋 본문 전량이라 draft 보다 더 크다)
+          # prompt/content 는 GITHUB_OUTPUT 이 아니라 파일로 넘긴다 (128KiB 한계)
           for path_env, body in (("SYSTEM_FILE", prompt), ("CONTENT_FILE", content)):
             with open(os.environ[path_env], "w", encoding="utf-8") as f:
               f.write(body)
@@ -723,14 +900,14 @@ jobs:
           PY
 
           echo "system_file=${SYSTEM_FILE} ($(wc -c < "${SYSTEM_FILE}") bytes)"
-          echo "content_file=${CONTENT_FILE} ($(wc -c < "${CONTENT_FILE}") bytes)"
+          echo "content_file=${CONTENT_FILE} ($(wc -c < "${CONTENT_FILE}") bytes, 압축 전 draft 대비)"
 
           {
             echo "system_file=$SYSTEM_FILE"
             echo "content_file=$CONTENT_FILE"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Gemini refine
+      - name: Gemini refine (pass 2)
         id: llm
         if: ${{ steps.prompt.outputs.content_file != '' }}
         uses: KPNP-R-D/github-actions-module/actions/gemini-generate@gemini-generate/v1
@@ -738,14 +915,8 @@ jobs:
           api_key: ${{ secrets.GEMINI_API_KEY }}
           model: gemini-2.5-flash
           temperature: 0.3
-          # 사고 토큰도 maxOutputTokens 예산을 함께 쓴다. 커밋 325개 실측:
-          #   기본  : 사고 46,554 + 본문  3,442 = 49,996 -> 본문 3,442 토큰에서 잘림
-          #   16384 : 사고 16,383 + 본문 33,613 = 49,996 -> 여전히 잘림(본문 101KB)
-          # 커밋 수에 비례해 본문이 커지므로 모델 출력 상한까지 열고 사고를 묶는다.
           max_output_tokens: 65535
           thinking_budget: "12288"
-          # 프롬프트가 커밋 로그 전량(150~480KB)이고 출력도 최대 50K 토큰이라
-          # 응답까지 수 분이 걸린다. 기본 60초로는 타임아웃한다.
           max_time: "600"
           # 503 UNAVAILABLE(모델 과부하)이 실제로 관측된다. 지수 백오프로 3회 재시도.
           retry: "3"

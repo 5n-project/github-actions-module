@@ -1,5 +1,5 @@
 name: "Gemini Generate"
-description: "Call Gemini generateContent and return text output"
+description: "Call Gemini generateContent and return text output (single or batched)"
 
 inputs:
   api_key:
@@ -21,6 +21,14 @@ inputs:
       지정하면 content 를 무시한다. 128KiB 초과 페이로드는 이 입력을 써야 한다.
     required: false
     default: ""
+  content_dir:
+    description: >-
+      배치 모드. 이 디렉토리의 파일을 정렬 순서대로 하나씩 별도 호출한다.
+      지정하면 content / content_file 을 무시한다.
+      출력은 text_dir 에 같은 파일명으로 쓰인다 (text / text_file 은 비워진다).
+      한 번의 호출로 출력 상한(maxOutputTokens)을 넘기는 분량을 나눠 처리할 때 쓴다.
+    required: false
+    default: ""
   temperature:
     required: false
     default: "0.1"
@@ -40,6 +48,7 @@ inputs:
       curl --max-time (초). 요청 1회의 전체 상한.
       대용량 프롬프트 + 큰 max_output_tokens 조합은 수 분이 걸린다
       (예: 프롬프트 148KB · max_output_tokens 50000 -> 60초로는 부족).
+      배치 모드에서는 호출 1건당 상한이다.
     required: false
     default: "600"
   retry:
@@ -62,11 +71,17 @@ inputs:
 
 outputs:
   text:
-    description: "Generated text"
+    description: "Generated text (배치 모드에서는 비어 있다)"
     value: ${{ steps.call.outputs.text }}
   text_file:
-    description: "Generated text 파일 경로 (128KiB 초과에도 안전)"
+    description: "Generated text 파일 경로 (128KiB 초과에도 안전). 배치 모드에서는 비어 있다"
     value: ${{ steps.call.outputs.text_file }}
+  text_dir:
+    description: "배치 모드 출력 디렉토리. 입력 파일과 같은 이름으로 쓰인다"
+    value: ${{ steps.call.outputs.text_dir }}
+  call_count:
+    description: "실제 API 호출 횟수"
+    value: ${{ steps.call.outputs.call_count }}
 
 runs:
   using: "composite"
@@ -78,6 +93,7 @@ runs:
         MODEL: ${{ inputs.model }}
         CONTENT: ${{ inputs.content }}
         CONTENT_FILE: ${{ inputs.content_file }}
+        CONTENT_DIR: ${{ inputs.content_dir }}
         TEMPERATURE: ${{ inputs.temperature }}
         MAX_OUTPUT_TOKENS: ${{ inputs.max_output_tokens }}
         THINKING_BUDGET: ${{ inputs.thinking_budget }}
@@ -94,30 +110,12 @@ runs:
         #    (단일 env/argv 문자열 상한 = MAX_ARG_STRLEN = 128KiB, 초과 시 execve E2BIG)
         # =========
         WORK="${RUNNER_TEMP:-/tmp}"
-        content_path="${WORK}/gemini_content.txt"
         sys_path="${WORK}/gemini_system.txt"
-        body_path="${WORK}/gemini_body.json"
-        resp_path="${WORK}/gemini_resp.json"
-        text_path="${WORK}/gemini_text.txt"
+        out_dir="${WORK}/gemini_out"
 
         # =========
-        # 1) content / system_instruction resolve (file 우선, inline 은 하위 호환)
+        # 1) system_instruction resolve (file 우선, inline 은 하위 호환)
         # =========
-        if [ -n "${CONTENT_FILE}" ]; then
-          if [ ! -f "${CONTENT_FILE}" ]; then
-            echo "::error::content_file not found: ${CONTENT_FILE}"
-            exit 1
-          fi
-          content_path="${CONTENT_FILE}"
-        else
-          printf '%s' "${CONTENT}" > "${content_path}"
-        fi
-
-        if [ ! -s "${content_path}" ]; then
-          echo "::error::content is empty. Pass either 'content' or 'content_file'."
-          exit 1
-        fi
-
         has_sys="false"
         if [ -n "${SYSTEM_INSTRUCTION_FILE}" ]; then
           if [ ! -f "${SYSTEM_INSTRUCTION_FILE}" ]; then
@@ -131,155 +129,208 @@ runs:
           has_sys="true"
         fi
 
-        echo "content=$(wc -c < "${content_path}") bytes, system_instruction=${has_sys}"
-
-        # =========
-        # 2) Build request body (jq --rawfile: 파일에서 직접 읽어 argv 우회)
-        # =========
-        if [ "${has_sys}" = "true" ]; then
-          jq -n \
-            --rawfile content "${content_path}" \
-            --rawfile sys "${sys_path}" \
-            --argjson temp "${TEMPERATURE}" \
-            --argjson maxTok "${MAX_OUTPUT_TOKENS}" \
-            '{
-              systemInstruction: { parts: [ { text: $sys } ] },
-              contents: [ { role: "user", parts: [ { text: $content } ] } ],
-              generationConfig: { temperature: $temp, maxOutputTokens: $maxTok }
-            }' > "${body_path}"
-        else
-          jq -n \
-            --rawfile content "${content_path}" \
-            --argjson temp "${TEMPERATURE}" \
-            --argjson maxTok "${MAX_OUTPUT_TOKENS}" \
-            '{
-              contents: [ { role: "user", parts: [ { text: $content } ] } ],
-              generationConfig: { temperature: $temp, maxOutputTokens: $maxTok }
-            }' > "${body_path}"
-        fi
-
-        # thinkingBudget 은 지정했을 때만 실어보낸다 (미지정 = 모델 기본값)
-        if [ -n "${THINKING_BUDGET}" ]; then
-          jq --argjson tb "${THINKING_BUDGET}" \
-            '.generationConfig.thinkingConfig = { thinkingBudget: $tb }' \
-            "${body_path}" > "${body_path}.tmp"
-          mv "${body_path}.tmp" "${body_path}"
-        fi
-
-        # =========
-        # 3) HTTP request (network/timeout/status) hardening
-        #    body 는 --data-binary @file 로 전송한다
-        #    (-d "${BODY}" 는 argv 128KiB 한계에 걸린다)
-        # =========
         url="https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent"
 
-        echo "POST ${MODEL} (max_time=${MAX_TIME}s, retry=${RETRY}, body=$(wc -c < "${body_path}") bytes)"
-
-        # --retry-delay 를 주지 않아야 curl 기본 지수 백오프(1s, 2s, 4s ...)가 동작한다.
-        # 503 UNAVAILABLE(모델 과부하)는 고정 1초 간격 재시도로는 잘 안 풀린다.
-        # --retry-max-time 은 "새 재시도를 시작할 수 있는 창"이라 최악 대기는 2 * max_time 이다.
-        http_code="$(
-          curl -sS --fail-with-body \
-            --connect-timeout 10 \
-            --max-time "${MAX_TIME}" \
-            --retry "${RETRY}" \
-            --retry-max-time "${MAX_TIME}" \
-            --retry-all-errors \
-            -o "${resp_path}" \
-            -w "%{http_code}" \
-            -X POST "$url" \
-            -H "x-goog-api-key: ${GEMINI_API_KEY}" \
-            -H "Content-Type: application/json" \
-            --data-binary @"${body_path}" \
-          || true
-        )"
-
-        # curl 자체 실패(네트워크/timeout 등) -> http_code 비거나 000
-        if [ -z "${http_code}" ] || [ "${http_code}" = "000" ]; then
-          echo "::error::HTTP request failed (network/timeout). max_time=${MAX_TIME}s retry=${RETRY} body=$(wc -c < "${body_path}") bytes. 프롬프트나 max_output_tokens 가 크면 max_time 을 늘려야 한다."
-          exit 1
-        fi
-
-        # 2xx 아니면 실패 (본문 앞부분만 — 전량 덤프는 annotation 한계를 넘긴다)
-        if [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 300 ]; then
-          echo "::error::HTTP ${http_code} from Gemini API. Body: $(head -c 2000 "${resp_path}")"
-          exit 1
-        fi
-
         # =========
-        # 4) JSON parse + API error object
+        # 2) 호출 1건 = build body -> POST -> validate -> write text
+        #    $1 = content 파일, $2 = 출력 파일, $3 = 로그 라벨
         # =========
-        jq -e . "${resp_path}" >/dev/null 2>&1 || {
-          echo "::error::Non-JSON response from Gemini. Raw: $(head -c 2000 "${resp_path}")"
-          exit 1
+        do_call() {
+          local in_path="$1" text_path="$2" label="$3"
+          local body_path="${WORK}/gemini_body.json"
+          local resp_path="${WORK}/gemini_resp.json"
+
+          if [ ! -s "${in_path}" ]; then
+            echo "::error::${label}: content is empty (${in_path})"
+            return 1
+          fi
+
+          # jq --rawfile: 파일에서 직접 읽어 argv 우회
+          if [ "${has_sys}" = "true" ]; then
+            jq -n \
+              --rawfile content "${in_path}" \
+              --rawfile sys "${sys_path}" \
+              --argjson temp "${TEMPERATURE}" \
+              --argjson maxTok "${MAX_OUTPUT_TOKENS}" \
+              '{
+                systemInstruction: { parts: [ { text: $sys } ] },
+                contents: [ { role: "user", parts: [ { text: $content } ] } ],
+                generationConfig: { temperature: $temp, maxOutputTokens: $maxTok }
+              }' > "${body_path}"
+          else
+            jq -n \
+              --rawfile content "${in_path}" \
+              --argjson temp "${TEMPERATURE}" \
+              --argjson maxTok "${MAX_OUTPUT_TOKENS}" \
+              '{
+                contents: [ { role: "user", parts: [ { text: $content } ] } ],
+                generationConfig: { temperature: $temp, maxOutputTokens: $maxTok }
+              }' > "${body_path}"
+          fi
+
+          # thinkingBudget 은 지정했을 때만 실어보낸다 (미지정 = 모델 기본값)
+          if [ -n "${THINKING_BUDGET}" ]; then
+            jq --argjson tb "${THINKING_BUDGET}" \
+              '.generationConfig.thinkingConfig = { thinkingBudget: $tb }' \
+              "${body_path}" > "${body_path}.tmp"
+            mv "${body_path}.tmp" "${body_path}"
+          fi
+
+          echo "${label}: POST ${MODEL} (content=$(wc -c < "${in_path}") bytes, body=$(wc -c < "${body_path}") bytes, max_time=${MAX_TIME}s, retry=${RETRY})"
+
+          # body 는 --data-binary @file 로 전송한다 (-d "${BODY}" 는 argv 128KiB 한계에 걸린다)
+          # --retry-delay 를 주지 않아야 curl 기본 지수 백오프(1s, 2s, 4s ...)가 동작한다.
+          # 503 UNAVAILABLE(모델 과부하)는 고정 1초 간격 재시도로는 잘 안 풀린다.
+          # --retry-max-time 은 "새 재시도를 시작할 수 있는 창"이라 최악 대기는 2 * max_time 이다.
+          local http_code
+          http_code="$(
+            curl -sS --fail-with-body \
+              --connect-timeout 10 \
+              --max-time "${MAX_TIME}" \
+              --retry "${RETRY}" \
+              --retry-max-time "${MAX_TIME}" \
+              --retry-all-errors \
+              -o "${resp_path}" \
+              -w "%{http_code}" \
+              -X POST "$url" \
+              -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+              -H "Content-Type: application/json" \
+              --data-binary @"${body_path}" \
+            || true
+          )"
+
+          # curl 자체 실패(네트워크/timeout 등) -> http_code 비거나 000
+          if [ -z "${http_code}" ] || [ "${http_code}" = "000" ]; then
+            echo "::error::${label}: HTTP request failed (network/timeout). max_time=${MAX_TIME}s retry=${RETRY} body=$(wc -c < "${body_path}") bytes. 프롬프트나 max_output_tokens 가 크면 max_time 을 늘려야 한다."
+            return 1
+          fi
+
+          # 2xx 아니면 실패 (본문 앞부분만 — 전량 덤프는 annotation 한계를 넘긴다)
+          if [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 300 ]; then
+            echo "::error::${label}: HTTP ${http_code} from Gemini API. Body: $(head -c 2000 "${resp_path}")"
+            return 1
+          fi
+
+          jq -e . "${resp_path}" >/dev/null 2>&1 || {
+            echo "::error::${label}: Non-JSON response from Gemini. Raw: $(head -c 2000 "${resp_path}")"
+            return 1
+          }
+
+          if jq -e '.error != null' "${resp_path}" >/dev/null; then
+            local code status msg
+            code="$(jq -r '.error.code // empty' "${resp_path}")"
+            status="$(jq -r '.error.status // empty' "${resp_path}")"
+            msg="$(jq -r '.error.message // empty' "${resp_path}")"
+
+            if [ "$code" = "429" ] || [ "$status" = "RESOURCE_EXHAUSTED" ]; then
+              echo "::error::${label}: Gemini quota/rate limit (429/RESOURCE_EXHAUSTED): $msg"
+            elif [ "$code" = "400" ] || [ "$status" = "INVALID_ARGUMENT" ]; then
+              echo "::error::${label}: Gemini invalid request (400/INVALID_ARGUMENT): $msg"
+            elif [ "$code" = "401" ] || [ "$status" = "UNAUTHENTICATED" ]; then
+              echo "::error::${label}: Gemini auth failed (401/UNAUTHENTICATED): $msg"
+            elif [ "$code" = "403" ] || [ "$status" = "PERMISSION_DENIED" ]; then
+              echo "::error::${label}: Gemini permission denied (403/PERMISSION_DENIED): $msg"
+            else
+              echo "::error::${label}: Gemini API error (${code}/${status}): $msg"
+            fi
+            return 1
+          fi
+
+          # 사고 토큰(thoughts)도 maxOutputTokens 예산을 함께 쓴다.
+          # 잘림 원인을 눈으로 가릴 수 있게 항상 남긴다.
+          local finish_reason
+          finish_reason="$(jq -r '.candidates[0].finishReason // empty' "${resp_path}")"
+          echo "${label}: finishReason=${finish_reason:-<none>} | tokens: prompt=$(jq -r '.usageMetadata.promptTokenCount // 0' "${resp_path}") output=$(jq -r '.usageMetadata.candidatesTokenCount // 0' "${resp_path}") thoughts=$(jq -r '.usageMetadata.thoughtsTokenCount // 0' "${resp_path}") total=$(jq -r '.usageMetadata.totalTokenCount // 0' "${resp_path}") | maxOutputTokens=${MAX_OUTPUT_TOKENS} thinkingBudget=${THINKING_BUDGET:-<default>}"
+
+          jq -r '
+            (.candidates // []) as $c
+            | if ($c|length)==0 then "" else
+                ($c[0].content.parts // [])
+                | map(.text // "")
+                | join("\n")
+              end
+          ' "${resp_path}" > "${text_path}"
+
+          # jq -r 은 빈 문자열에도 개행 1바이트를 남긴다 -> 1바이트 이하면 빈 응답
+          if [ "$(wc -c < "${text_path}")" -le 1 ]; then
+            echo "::error::${label}: Gemini returned empty text. finishReason=${finish_reason}. Raw: $(head -c 2000 "${resp_path}")"
+            return 1
+          fi
+
+          echo "${label}: text=$(wc -c < "${text_path}") bytes"
+
+          # 잘림 가드 — finishReason 이 STOP 이 아니면 본문이 중간에 끊긴 것이다.
+          # (MAX_TOKENS / SAFETY / RECITATION 등)
+          # 통과시키면 잘린 결과가 성공으로 하류까지 흘러간다.
+          if [ -n "${finish_reason}" ] && [ "${finish_reason}" != "STOP" ]; then
+            echo "::error::${label}: Gemini response is incomplete: finishReason=${finish_reason} (text=$(wc -c < "${text_path}") bytes). MAX_TOKENS 이면 max_output_tokens 를 올리거나 thinking_budget 으로 사고 토큰을 제한하거나 입력을 나눠야 한다(content_dir 배치 모드). 사고 토큰도 max_output_tokens 예산을 함께 쓴다."
+            return 1
+          fi
         }
 
-        if jq -e '.error != null' "${resp_path}" >/dev/null; then
-          code="$(jq -r '.error.code // empty' "${resp_path}")"
-          status="$(jq -r '.error.status // empty' "${resp_path}")"
-          msg="$(jq -r '.error.message // empty' "${resp_path}")"
-
-          if [ "$code" = "429" ] || [ "$status" = "RESOURCE_EXHAUSTED" ]; then
-            echo "::error::Gemini quota/rate limit (429/RESOURCE_EXHAUSTED): $msg"
-          elif [ "$code" = "400" ] || [ "$status" = "INVALID_ARGUMENT" ]; then
-            echo "::error::Gemini invalid request (400/INVALID_ARGUMENT): $msg"
-          elif [ "$code" = "401" ] || [ "$status" = "UNAUTHENTICATED" ]; then
-            echo "::error::Gemini auth failed (401/UNAUTHENTICATED): $msg"
-          elif [ "$code" = "403" ] || [ "$status" = "PERMISSION_DENIED" ]; then
-            echo "::error::Gemini permission denied (403/PERMISSION_DENIED): $msg"
-          else
-            echo "::error::Gemini API error (${code}/${status}): $msg"
+        # =========
+        # 3) 배치 모드 / 단건 모드
+        # =========
+        if [ -n "${CONTENT_DIR}" ]; then
+          if [ ! -d "${CONTENT_DIR}" ]; then
+            echo "::error::content_dir not found: ${CONTENT_DIR}"
+            exit 1
           fi
+
+          mkdir -p "${out_dir}"
+          n=0
+          # 정렬 순서 고정 (배치 순서가 결과 순서다)
+          for f in $(find "${CONTENT_DIR}" -maxdepth 1 -type f | sort); do
+            n=$((n+1))
+            do_call "$f" "${out_dir}/$(basename "$f")" "batch $(basename "$f")"
+          done
+
+          if [ "$n" -eq 0 ]; then
+            echo "::error::content_dir is empty: ${CONTENT_DIR}"
+            exit 1
+          fi
+
+          echo "batched: ${n} call(s), out_dir=${out_dir}, total=$(cat "${out_dir}"/* | wc -c) bytes"
+          {
+            echo "text_dir=${out_dir}"
+            echo "call_count=${n}"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # --- 단건 모드 ---
+        content_path="${WORK}/gemini_content.txt"
+        if [ -n "${CONTENT_FILE}" ]; then
+          if [ ! -f "${CONTENT_FILE}" ]; then
+            echo "::error::content_file not found: ${CONTENT_FILE}"
+            exit 1
+          fi
+          content_path="${CONTENT_FILE}"
+        else
+          printf '%s' "${CONTENT}" > "${content_path}"
+        fi
+
+        if [ ! -s "${content_path}" ]; then
+          echo "::error::content is empty. Pass 'content', 'content_file' or 'content_dir'."
           exit 1
         fi
 
-        # =========
-        # 5) Usage / finishReason 진단
-        #    사고 토큰(thoughts)도 maxOutputTokens 예산을 함께 쓴다.
-        #    잘림을 눈으로 잡을 수 있게 항상 남긴다.
-        # =========
-        finish_reason="$(jq -r '.candidates[0].finishReason // empty' "${resp_path}")"
-        echo "finishReason=${finish_reason:-<none>} | tokens: prompt=$(jq -r '.usageMetadata.promptTokenCount // 0' "${resp_path}") output=$(jq -r '.usageMetadata.candidatesTokenCount // 0' "${resp_path}") thoughts=$(jq -r '.usageMetadata.thoughtsTokenCount // 0' "${resp_path}") total=$(jq -r '.usageMetadata.totalTokenCount // 0' "${resp_path}") | maxOutputTokens=${MAX_OUTPUT_TOKENS} thinkingBudget=${THINKING_BUDGET:-<default>}"
+        echo "content=$(wc -c < "${content_path}") bytes, system_instruction=${has_sys}"
+
+        text_path="${WORK}/gemini_text.txt"
+        do_call "${content_path}" "${text_path}" "single"
 
         # =========
-        # 6) Result validation (empty candidates/text) + parts join
-        # =========
-        jq -r '
-          (.candidates // []) as $c
-          | if ($c|length)==0 then "" else
-              ($c[0].content.parts // [])
-              | map(.text // "")
-              | join("\n")
-            end
-        ' "${resp_path}" > "${text_path}"
-
-        # jq -r 은 빈 문자열에도 개행 1바이트를 남긴다 -> 1바이트 이하면 빈 응답
-        if [ "$(wc -c < "${text_path}")" -le 1 ]; then
-          echo "::error::Gemini returned empty text. finishReason=${finish_reason}. Raw: $(head -c 2000 "${resp_path}")"
-          exit 1
-        fi
-
-        echo "text=$(wc -c < "${text_path}") bytes"
-
-        # =========
-        # 7) 잘림 가드
-        #    finishReason 이 STOP 이 아니면 본문이 중간에 끊긴 것이다.
-        #    (MAX_TOKENS / SAFETY / RECITATION 등)
-        #    이걸 통과시키면 잘린 릴리즈 노트가 성공으로 Notion 까지 올라간다.
-        # =========
-        if [ -n "${finish_reason}" ] && [ "${finish_reason}" != "STOP" ]; then
-          echo "::error::Gemini response is incomplete: finishReason=${finish_reason} (text=$(wc -c < "${text_path}") bytes). MAX_TOKENS 이면 max_output_tokens 를 올리거나 thinking_budget 으로 사고 토큰을 제한하거나 입력을 줄여야 한다. 사고 토큰도 max_output_tokens 예산을 함께 쓴다."
-          exit 1
-        fi
-
-        # =========
-        # 6) Output
+        # 4) Output
         #    text_file : 128KiB 초과에도 안전한 경로 전달용 (권장)
         #    text      : 기존 caller 호환용.
         #                GITHUB_OUTPUT 자체는 통과하지만 이 값을 다시 env 로 넘기면
         #                128KiB 한계에 걸린다 -> 대용량 응답에서는 text_file 을 쓸 것
         # =========
-        echo "text_file=${text_path}" >> "$GITHUB_OUTPUT"
+        {
+          echo "text_file=${text_path}"
+          echo "call_count=1"
+        } >> "$GITHUB_OUTPUT"
 
         DELIM="__EOF_$(date +%s%N)__"
         {
