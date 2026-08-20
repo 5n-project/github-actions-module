@@ -141,6 +141,41 @@ Optional:
 
 ---
 
+## 대용량 페이로드 취급 (128KiB 한계)
+
+리눅스 `MAX_ARG_STRLEN` = **131,072 bytes(128KiB)** 는 **단일 env 값 / 단일 argv 문자열**의 상한이다.
+초과하면 `execve`가 `E2BIG`을 반환하고 러너가 스텝 쉘 자체를 못 띄운다:
+
+```
+An error occurred trying to start process '/usr/bin/bash' with working directory '...'.
+Argument list too long
+```
+
+이 워크플로는 커밋 **본문 전량**(`%B`)을 draft 로 만들기 때문에 실측 **148KB** 를 넘긴 사례가 있다.
+`git log -n 80` 상한은 커밋 **개수** 제한이라 바이트 상한이 아니다 —
+80커밋 × 평균 1.8KB 만으로 이미 141KB 다.
+
+그래서 대용량 값은 **본문을 output/env 로 릴레이하지 않고 `$RUNNER_TEMP` 파일에 쓰고 경로만 넘긴다.**
+
+| 값 | 전달 방식 |
+|---|---|
+| draft (커밋 로그 전량) | `steps.build_draft.outputs.draft_file` → `$RUNNER_TEMP/release_draft.md` |
+| Gemini system prompt | `steps.prompt.outputs.system_file` → `$RUNNER_TEMP/gemini_system.md` |
+| Gemini content (prompt + 커밋 로그) | `steps.prompt.outputs.content_file` → `$RUNNER_TEMP/gemini_content.md` |
+| Gemini 응답 | `steps.llm.outputs.text_file` → `$RUNNER_TEMP/gemini_text.txt` |
+| Notion 본문 | `DRAFT_FILE` / `RELEASE_NOTES_FILE` env (경로) |
+
+작게 유지되는 값(`manifest_json` 약 1.5KB, `has_commits`, `commit_count`,
+`service_commit_counts`, `releaseKey`, `page_id`)은 그대로 output/env 로 넘긴다.
+
+**이 워크플로를 수정할 때 지켜야 할 것:**
+
+* 커밋 로그·프롬프트·LLM 응답 계열 값을 `env:` 나 action `with:` 에 **본문으로** 넣지 않는다
+* `curl -d "$BODY"` 같은 argv 전달도 같은 한계에 걸린다 → `--data-binary @<file>` 을 쓴다
+* `$RUNNER_TEMP` 는 **같은 job 안에서만** 공유된다 (이 워크플로는 단일 job `start` 이라 문제없음)
+
+---
+
 <details>
 <summary><strong>Steps detail</strong></summary>
 
@@ -202,7 +237,8 @@ YML 파일을 만들지 않고 **manifest JSON**을 계산해 step output으로 
   * `[RN-BOT]` 포함 커밋 제외
 * output:
 
-  * `draft`, `has_commits`, `commit_count`, `service_commit_counts`
+  * `draft_file`(= `$RUNNER_TEMP/release_draft.md` 경로), `has_commits`, `commit_count`, `service_commit_counts`
+  * **draft 본문은 output/env 로 내보내지 않는다** — 아래 “대용량 페이로드 취급” 참고
 * Step Summary에 debug(cmd/output + draft)를 `<details>`로 append
 
 ### 5) Fail job if no commit messages
@@ -216,20 +252,23 @@ YML 파일을 만들지 않고 **manifest JSON**을 계산해 step output으로 
   * `gemini/release-notes.system.md`
   * `gemini/release-notes.input.md`
   * `release-notes.template.md`
-* input 템플릿에 `{{TEMPLATE}}`, `{{COMMITS}}` 치환 → Gemini `content`
-* 결과: `steps.prompt.outputs.prompt/content`
+* `{{COMMITS}}` 는 `draft_file` 을 **파일에서 읽어** 치환, `{{TEMPLATE}}` 는 template 파일로 치환
+* 결과를 파일로 기록하고 경로만 output:
+
+  * `steps.prompt.outputs.system_file` (= `$RUNNER_TEMP/gemini_system.md`)
+  * `steps.prompt.outputs.content_file` (= `$RUNNER_TEMP/gemini_content.md`)
 
 ### 7) Gemini refine
 
-* `actions/gemini-generate` 호출
+* `actions/gemini-generate` 호출 (`if: steps.prompt.outputs.content_file != ''`)
 
-  * `system_instruction = prompt`
-  * `content = content`
-* 결과: `steps.llm.outputs.text`
+  * `system_instruction_file = system_file`
+  * `content_file = content_file`
+* 결과: `steps.llm.outputs.text_file` (본문은 `steps.llm.outputs.text` 로도 나오지만 릴레이에는 쓰지 않는다)
 
 ### 8) Append Gemini output to Step Summary
 
-* Step Summary에 Gemini 결과 그대로 기록
+* `text_file` 경로를 받아 파일을 읽어 Step Summary에 기록
 
 ### 9) Create Notion page (draft)
 
@@ -246,7 +285,7 @@ YML 파일을 만들지 않고 **manifest JSON**을 계산해 step output으로 
 * Notion page 생성 properties:
 
   * 제목=releaseKey, 구분=notion_category, 배포 날짜=today, 배포 버전, 프로젝트
-* 본문 append
+* 본문 append (`DRAFT_FILE` / `RELEASE_NOTES_FILE` 경로를 받아 파일에서 읽는다)
 
   * 데이터2(=Gemini) 상단 append (hr `---` 제거)
   * divider 1개
@@ -281,7 +320,7 @@ YML 파일을 만들지 않고 **manifest JSON**을 계산해 step output으로 
 ```yaml
 jobs:
   call-release-generate-notes-and-tag:
-    uses: 5n-project/github-actions-module/.github/workflows/release-generate-notes-and-tag.reusable.yml@v1.0.0
+    uses: KPNP-R-D/github-actions-module/.github/workflows/release.reusable.yml@v1
     with:
       catalog_path: .github/release/service-catalog.json
       prompts_dir: prompts
@@ -332,3 +371,16 @@ permissions:
 
 * 범위 내 커밋이 없거나 `[RN-BOT]` 필터로 전부 제외된 케이스.
 * Step Summary의 debug(각 서비스 git log cmd/출력)로 범위 확인.
+
+### `Argument list too long` (E2BIG)
+
+```
+An error occurred trying to start process '/usr/bin/bash' with working directory '...'.
+Argument list too long
+```
+
+* 스텝 **내용**이 아니라 스텝 **기동**이 실패한 것이다 — 단일 env/argv 값이 128KiB 를 넘었다.
+* 실패한 스텝의 로그에서 `##[group]Run ...` 하단 env 에코를 보고 어떤 값이 큰지 찾는다.
+* 해당 값을 `$RUNNER_TEMP` 파일로 옮기고 경로만 넘긴다. 위 “대용량 페이로드 취급(128KiB 한계)” 참고.
+* 호출 측(`current_tags`, catalog `sharedPaths`)으로는 실질적으로 해소되지 않는다 —
+  `globalPrevSha` 가 서비스의 직전 태그로 고정되기 때문이다.

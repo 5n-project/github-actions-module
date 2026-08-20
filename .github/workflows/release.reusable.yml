@@ -364,7 +364,13 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --tags --force
-          
+
+          # draft 는 커밋 본문 전량이라 100KB 를 쉽게 넘긴다.
+          # env/argv 단일 문자열 상한(MAX_ARG_STRLEN = 128KiB)을 넘기면 다음 스텝의
+          # 쉘 기동 자체가 execve E2BIG("Argument list too long")으로 실패하므로
+          # 본문은 파일에 쓰고 스텝 간에는 경로만 넘긴다.
+          export DRAFT_FILE="${RUNNER_TEMP}/release_draft.md"
+
           result="$(python - <<'PY'
           import os, subprocess, json, re, html
           from datetime import datetime
@@ -644,27 +650,28 @@ jobs:
               summary_fp.write("</code></pre>\n\n")
               summary_fp.write("</details>\n")
           
-          # A안: JSON 한 덩어리로 출력
+          # draft 본문은 파일로, stdout 에는 메타데이터만 (env/argv 128KiB 한계 회피)
+          with open(os.environ["DRAFT_FILE"], "w", encoding="utf-8") as f:
+            f.write(text)
+            if not text.endswith("\n"):
+              f.write("\n")
+
           print(json.dumps({
-            "draft": text,
             "has_commits": (total_commit_count > 0),
             "commit_count": total_commit_count,
             "service_commit_counts": service_commit_counts,
           }, ensure_ascii=False))
           PY
           )"
-          
-          draft="$(echo "$result" | jq -r '.draft')"
+
           has_commits="$(echo "$result" | jq -r '.has_commits')"
           commit_count="$(echo "$result" | jq -r '.commit_count')"
           svc_counts="$(echo "$result" | jq -c '.service_commit_counts')"
 
-          delim="__DRAFT_$(openssl rand -hex 16)__"
-          
+          echo "draft_file=${DRAFT_FILE} ($(wc -c < "${DRAFT_FILE}") bytes)"
+
           {
-            echo "draft<<$delim"
-            echo "$draft"
-            echo "$delim"
+            echo "draft_file=$DRAFT_FILE"
             echo "has_commits=$has_commits"
             echo "commit_count=$commit_count"
             echo "service_commit_counts=$svc_counts"
@@ -679,65 +686,77 @@ jobs:
         shell: bash
         if: ${{ steps.build_draft.outputs.has_commits == 'true' }}
         env:
-          COMMITS_DRAFT: ${{ steps.build_draft.outputs.draft }}
+          # 본문이 아니라 경로만 넘긴다 (draft 는 100KB 이상 -> env 로는 E2BIG)
+          DRAFT_FILE: ${{ steps.build_draft.outputs.draft_file }}
           PROMPTS_DIR: ${{ inputs.prompts_dir }}
         run: |
           set -euo pipefail
+
+          export SYSTEM_FILE="${RUNNER_TEMP}/gemini_system.md"
+          export CONTENT_FILE="${RUNNER_TEMP}/gemini_content.md"
+
           python - <<'PY'
           from pathlib import Path
-          import os, uuid
+          import os
 
           prompts_dir = Path(os.environ["PROMPTS_DIR"])
 
           prompt = (prompts_dir / "gemini/release-notes.system.md").read_text(encoding="utf-8")
           input_md = (prompts_dir / "gemini/release-notes.input.md").read_text(encoding="utf-8")
           template = (prompts_dir / "release-notes.template.md").read_text(encoding="utf-8")
-          commits = os.environ.get("COMMITS_DRAFT", "")
+
+          draft_file = os.environ.get("DRAFT_FILE") or ""
+          commits = Path(draft_file).read_text(encoding="utf-8") if draft_file and os.path.isfile(draft_file) else ""
 
           content = (input_md
             .replace("{{TEMPLATE}}", template)
             .replace("{{COMMITS}}", commits)
           )
 
-          out_path = os.environ["GITHUB_OUTPUT"]
-
-          with open(out_path, "a", encoding="utf-8") as f:
-            delim = f"__PROMPT_{uuid.uuid4().hex}__"
-            f.write(f"prompt<<{delim}\n")
-            f.write(prompt + ("\n" if not prompt.endswith("\n") else ""))
-            f.write(f"{delim}\n")
-
-          with open(out_path, "a", encoding="utf-8") as f:
-            delim = f"__CONTENT_{uuid.uuid4().hex}__"
-            f.write(f"content<<{delim}\n")
-            f.write(content + ("\n" if not content.endswith("\n") else ""))
-            f.write(f"{delim}\n")
+          # prompt/content 는 GITHUB_OUTPUT 이 아니라 파일로 넘긴다.
+          # (content = 프롬프트 + 커밋 본문 전량이라 draft 보다 더 크다)
+          for path_env, body in (("SYSTEM_FILE", prompt), ("CONTENT_FILE", content)):
+            with open(os.environ[path_env], "w", encoding="utf-8") as f:
+              f.write(body)
+              if not body.endswith("\n"):
+                f.write("\n")
           PY
+
+          echo "system_file=${SYSTEM_FILE} ($(wc -c < "${SYSTEM_FILE}") bytes)"
+          echo "content_file=${CONTENT_FILE} ($(wc -c < "${CONTENT_FILE}") bytes)"
+
+          {
+            echo "system_file=$SYSTEM_FILE"
+            echo "content_file=$CONTENT_FILE"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Gemini refine
         id: llm
-        if: ${{ steps.prompt.outputs.content != '' }}
-        uses: 5n-project/github-actions-module/actions/gemini-generate@gemini-generate/v1
+        if: ${{ steps.prompt.outputs.content_file != '' }}
+        uses: KPNP-R-D/github-actions-module/actions/gemini-generate@gemini-generate/v1
         with:
           api_key: ${{ secrets.GEMINI_API_KEY }}
           model: gemini-2.5-flash
           temperature: 0.3
           max_output_tokens: 50000
-          system_instruction: ${{ steps.prompt.outputs.prompt }}
-          content: ${{ steps.prompt.outputs.content }}
+          system_instruction_file: ${{ steps.prompt.outputs.system_file }}
+          content_file: ${{ steps.prompt.outputs.content_file }}
 
       - name: Append Gemini output to Step Summary
         shell: bash
-        if: ${{ steps.llm.outputs.text != '' }}
+        if: ${{ steps.llm.outputs.text_file != '' }}
         env:
-          LLM_TEXT: ${{ steps.llm.outputs.text }}
+          # max_output_tokens: 50000 이므로 응답도 128KiB 를 넘길 수 있다 -> 경로로 받는다
+          LLM_TEXT_FILE: ${{ steps.llm.outputs.text_file }}
         run: |
           set -euo pipefail
           python - <<'PY'
           import os
+          from pathlib import Path
 
           summary_path = os.environ["GITHUB_STEP_SUMMARY"]
-          text = os.environ.get("LLM_TEXT", "")
+          text_file = os.environ.get("LLM_TEXT_FILE") or ""
+          text = Path(text_file).read_text(encoding="utf-8") if text_file and os.path.isfile(text_file) else ""
 
           with open(summary_path, "a", encoding="utf-8") as f:
             f.write("## Gemini refined release notes\n\n")
@@ -758,8 +777,9 @@ jobs:
           NOTION_CATEGORY: ${{ inputs.notion_category }}
 
           KEY: ${{ steps.key.outputs.key }}
-          DRAFT: ${{ steps.build_draft.outputs.draft }}
-          RELEASE_NOTES: ${{ steps.llm.outputs.text }}
+          # 본문이 아니라 경로만 넘긴다 (draft·릴리즈 노트 모두 128KiB 를 넘길 수 있다)
+          DRAFT_FILE: ${{ steps.build_draft.outputs.draft_file }}
+          RELEASE_NOTES_FILE: ${{ steps.llm.outputs.text_file }}
 
           MANIFEST_JSON: ${{ steps.manifest.outputs.manifest_json }}
         run: |
@@ -895,8 +915,15 @@ jobs:
           python - <<'PY'
           import os, json, re
 
-          release_notes = (os.environ.get("RELEASE_NOTES") or "").strip()
-          draft = (os.environ.get("DRAFT") or "").strip()
+          def read_env_file(var: str) -> str:
+            path = os.environ.get(var) or ""
+            if not path or not os.path.isfile(path):
+              return ""
+            with open(path, encoding="utf-8") as f:
+              return f.read()
+
+          release_notes = read_env_file("RELEASE_NOTES_FILE").strip()
+          draft = read_env_file("DRAFT_FILE").strip()
 
           def rt_plain(text: str):
             return [{"type":"text","text":{"content": (text or "")[:2000]}}]
