@@ -58,6 +58,13 @@ inputs:
       --retry-max-time 을 max_time 으로 묶어 최악 대기시간을 2 * max_time 으로 제한한다.
     required: false
     default: "3"
+  quota_retry:
+    description: >-
+      429(rate limit / quota) 재시도 횟수. curl 의 지수 백오프로는 못 넘기는 케이스다 —
+      무료 티어 분당 한도는 "35초 뒤 재시도" 수준을 요구한다.
+      응답의 RetryInfo.retryDelay 를 읽어 그만큼(5~180초) 기다린 뒤 재시도한다.
+    required: false
+    default: "3"
   system_instruction:
     description: >-
       System instruction (inline). content 와 동일하게 128KiB 제약을 받는다.
@@ -99,6 +106,7 @@ runs:
         THINKING_BUDGET: ${{ inputs.thinking_budget }}
         MAX_TIME: ${{ inputs.max_time }}
         RETRY: ${{ inputs.retry }}
+        QUOTA_RETRY: ${{ inputs.quota_retry }}
         SYSTEM_INSTRUCTION: ${{ inputs.system_instruction }}
         SYSTEM_INSTRUCTION_FILE: ${{ inputs.system_instruction_file }}
       run: |
@@ -182,32 +190,62 @@ runs:
           # --retry-delay 를 주지 않아야 curl 기본 지수 백오프(1s, 2s, 4s ...)가 동작한다.
           # 503 UNAVAILABLE(모델 과부하)는 고정 1초 간격 재시도로는 잘 안 풀린다.
           # --retry-max-time 은 "새 재시도를 시작할 수 있는 창"이라 최악 대기는 2 * max_time 이다.
-          local http_code
-          http_code="$(
-            curl -sS --fail-with-body \
-              --connect-timeout 10 \
-              --max-time "${MAX_TIME}" \
-              --retry "${RETRY}" \
-              --retry-max-time "${MAX_TIME}" \
-              --retry-all-errors \
-              -o "${resp_path}" \
-              -w "%{http_code}" \
-              -X POST "$url" \
-              -H "x-goog-api-key: ${GEMINI_API_KEY}" \
-              -H "Content-Type: application/json" \
-              --data-binary @"${body_path}" \
-            || true
-          )"
+          local http_code attempt=0 max_attempts=$((QUOTA_RETRY + 1)) wait_s
+          while : ; do
+            attempt=$((attempt + 1))
+            http_code="$(
+              curl -sS --fail-with-body \
+                --connect-timeout 10 \
+                --max-time "${MAX_TIME}" \
+                --retry "${RETRY}" \
+                --retry-max-time "${MAX_TIME}" \
+                --retry-all-errors \
+                -o "${resp_path}" \
+                -w "%{http_code}" \
+                -X POST "$url" \
+                -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+                -H "Content-Type: application/json" \
+                --data-binary @"${body_path}" \
+              || true
+            )"
 
-          # curl 자체 실패(네트워크/timeout 등) -> http_code 비거나 000
-          if [ -z "${http_code}" ] || [ "${http_code}" = "000" ]; then
-            echo "::error::${label}: HTTP request failed (network/timeout). max_time=${MAX_TIME}s retry=${RETRY} body=$(wc -c < "${body_path}") bytes. 프롬프트나 max_output_tokens 가 크면 max_time 을 늘려야 한다."
-            return 1
-          fi
+            # curl 자체 실패(네트워크/timeout 등) -> http_code 비거나 000
+            if [ -z "${http_code}" ] || [ "${http_code}" = "000" ]; then
+              echo "::error::${label}: HTTP request failed (network/timeout). max_time=${MAX_TIME}s retry=${RETRY} body=$(wc -c < "${body_path}") bytes. 프롬프트나 max_output_tokens 가 크면 max_time 을 늘려야 한다."
+              return 1
+            fi
+
+            # 429 = rate limit / quota.
+            # curl --retry 의 지수 백오프(1s, 2s, 4s ...)로는 못 넘긴다 —
+            # 무료 티어 분당 한도는 "35초 뒤 재시도" 수준을 요구한다.
+            # 응답의 RetryInfo.retryDelay(없으면 message 의 "retry in Ns")를 읽어 그만큼 기다린다.
+            if [ "${http_code}" = "429" ] && [ "${attempt}" -lt "${max_attempts}" ]; then
+              wait_s="$(jq -r '
+                [ .error.details[]? | select((.["@type"] // "") | test("RetryInfo")) | .retryDelay ]
+                | first // ""
+                | tostring | sub("s$"; "")
+              ' "${resp_path}" 2>/dev/null || true)"
+              if [ -z "${wait_s}" ] || [ "${wait_s}" = "null" ]; then
+                wait_s="$(jq -r '.error.message // ""' "${resp_path}" 2>/dev/null \
+                  | grep -oE 'retry in [0-9]+' | grep -oE '[0-9]+' | head -1 || true)"
+              fi
+              case "${wait_s}" in ''|*[!0-9.]*) wait_s="" ;; esac
+              wait_s="${wait_s%%.*}"
+              [ -n "${wait_s}" ] || wait_s=30
+              [ "${wait_s}" -lt 5 ] && wait_s=5
+              [ "${wait_s}" -gt 180 ] && wait_s=180
+              wait_s=$((wait_s + 2))   # 서버 기준시간과의 오차 여유
+              echo "::warning::${label}: HTTP 429 (quota/rate limit). ${wait_s}s 대기 후 재시도 (${attempt}/${max_attempts})"
+              sleep "${wait_s}"
+              continue
+            fi
+
+            break
+          done
 
           # 2xx 아니면 실패 (본문 앞부분만 — 전량 덤프는 annotation 한계를 넘긴다)
           if [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 300 ]; then
-            echo "::error::${label}: HTTP ${http_code} from Gemini API. Body: $(head -c 2000 "${resp_path}")"
+            echo "::error::${label}: HTTP ${http_code} from Gemini API (attempts=${attempt}). Body: $(head -c 2000 "${resp_path}")"
             return 1
           fi
 

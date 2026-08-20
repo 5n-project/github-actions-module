@@ -42,6 +42,10 @@ Caller에서:
 * `manifest_dir` (string, default: `releases`)
 
   * 현재 워크플로에서는 **YML 파일을 생성하지 않음**. (입력 정의는 유지)
+* `compact_batch_size` (string, default: `"80"`)
+  PASS 1(커밋 메시지 정제) 배치 1건에 담을 커밋 수.
+  커밋당 출력이 약 160~200 토큰이므로 80이면 배치당 약 16K 토큰이다.
+  아래 “출력 상한과 2-pass” 참고.
 * `current_tags` (string, default: `""`)
   선택된 서비스들의 현재 배포 버전 매핑. 사실상 필수값.
   형식: `key=value,key=value` (CSV)
@@ -176,6 +180,43 @@ Argument list too long
 
 ---
 
+## 출력 상한과 2-pass
+
+128KiB 문제(입력)를 해소하면 곧 **출력 상한**(모델이 한 번에 쓸 수 있는 양)에 부딪힌다.
+
+`gemini-2.5-flash` 는 thinking 모델이고 **사고 토큰이 `maxOutputTokens` 예산을 함께 쓴다.**
+커밋 322개(prompt 151,877 토큰)를 한 번에 넘긴 실측:
+
+| thinkingBudget | maxOutputTokens | 사고 | 본문 | 본문 크기 | finishReason |
+|---|---|---|---|---|---|
+| 기본(미지정) | 50,000 | 46,554 | 3,442 | 11,949 B | `MAX_TOKENS` |
+| 16,384 | 50,000 | 16,383 | 33,613 | 101,763 B | `MAX_TOKENS` |
+| 12,288 | **65,535** (모델 상한) | 12,285 | 53,246 | 164,874 B | `MAX_TOKENS` |
+
+65,535 는 모델 출력 상한이라 더 올릴 수 없고, **출력 분량은 커밋 수에 비례**한다.
+그래서 호출을 나눈다.
+
+```
+PASS 1 (배치 N회)  커밋을 compact_batch_size 개씩 나눠 "커밋당 몇 줄"로 압축
+                   -> 배치당 출력 5~8K 토큰. 상한에 여유가 크다
+PASS 2 (1회)       압축본 전체 + TEMPLATE -> 릴리즈 노트 문서 1개
+```
+
+PASS 2 는 **caller 의 기존 프롬프트를 그대로** 쓴다. 입력만 원본 draft 대신 압축본으로
+바뀌므로 문서 병합 파서가 필요 없고 Summary 도 한 문서 안에서 생성된다.
+`release-notes.compact.md` 를 두지 않은 caller 는 워크플로 내장 기본 프롬프트로 동작한다.
+
+실측(커밋 322개 · draft 475,771 bytes · `compact_batch_size: 80`):
+
+* PASS 1: 5회 호출, 전부 `finishReason=STOP`, 출력 합계 95,783 bytes (draft 대비 80% 압축)
+* PASS 2: prompt 31,446 · 본문 13,792 · 사고 12,284 = 57,522 / 65,535 → `STOP`
+* 최종 릴리즈 노트 45,491 bytes
+
+**잘림은 조용히 지나가지 않는다.** 액션이 `finishReason != STOP` 이면 실패시키므로,
+부분 응답이 Notion 까지 올라가는 경로는 막혀 있다.
+
+---
+
 <details>
 <summary><strong>Steps detail</strong></summary>
 
@@ -245,34 +286,60 @@ YML 파일을 만들지 않고 **manifest JSON**을 계산해 step output으로 
 
 * `has_commits != true`면 `exit 1` (빈 릴리즈 차단)
 
-### 6) Build Gemini content
+### 6) Build compact batches (PASS 1 입력)
+
+Gemini 호출은 **2-pass** 다. 이유는 아래 “출력 상한과 2-pass” 참고.
+
+* `draft_file` 을 `(섹션, 커밋 블록)` 단위로 쪼갠다
+  (커밋 블록 = 커밋 제목 줄 + 뒤따르는 들여쓴 본문 줄 전체)
+* `compact_batch_size` 개씩 배치로 나눠 `$RUNNER_TEMP/gemini_batches/batch_NNN.md` 로 쓴다.
+  배치마다 해당 섹션 헤더(`## Shared` 등)를 다시 얹으므로 배치만 봐도 그룹을 알 수 있다
+* PASS 1 프롬프트 결정:
+
+  * `${prompts_dir}/gemini/release-notes.compact.md` 가 있으면 그것을 사용
+  * 없으면 **워크플로 내장 기본값**을 사용 → 기존 caller 는 파일 추가 없이 동작한다
+* output: `batch_dir`, `compact_system_file`, `batch_count`, `commit_count`
+
+### 7) Gemini compact (PASS 1)
+
+* `actions/gemini-generate` 를 **배치 모드**로 호출 (`content_dir: batch_dir`)
+* 액션이 디렉토리의 파일을 정렬 순서대로 하나씩 개별 호출하고,
+  각 호출마다 재시도·에러 분기·`finishReason` 잘림 가드를 동일하게 적용한다
+* PASS 1 은 커밋 **제목을 원문 그대로** 남긴다 —
+  PASS 2 의 그룹 매핑이 제목 prefix(`[Scope]` / `type(scope):`)에 의존한다
+* 결과: `steps.compact.outputs.text_dir` (배치별 출력), `call_count`
+
+### 8) Build Gemini content (PASS 2)
 
 * `${prompts_dir}`에서 다음 파일 로드:
 
   * `gemini/release-notes.system.md`
   * `gemini/release-notes.input.md`
   * `release-notes.template.md`
-* `{{COMMITS}}` 는 `draft_file` 을 **파일에서 읽어** 치환, `{{TEMPLATE}}` 는 template 파일로 치환
+* `{{COMMITS}}` 는 **PASS 1 배치 출력물을 순서대로 이어붙인 압축본**으로 치환,
+  `{{TEMPLATE}}` 는 template 파일로 치환
+* 즉 caller 프롬프트 계약은 그대로다. 입력만 원본 draft 대신 압축본으로 바뀐다
 * 결과를 파일로 기록하고 경로만 output:
 
   * `steps.prompt.outputs.system_file` (= `$RUNNER_TEMP/gemini_system.md`)
   * `steps.prompt.outputs.content_file` (= `$RUNNER_TEMP/gemini_content.md`)
 
-### 7) Gemini refine
+### 9) Gemini refine (PASS 2)
 
-* `actions/gemini-generate` 호출 (`if: steps.prompt.outputs.content_file != ''`)
+* `actions/gemini-generate` 단건 호출 (`if: steps.prompt.outputs.content_file != ''`)
 
   * `system_instruction_file = system_file`
   * `content_file = content_file`
-  * `max_time: "600"` / `retry: "3"` — 프롬프트가 약 150KB(≈40K 토큰)이고
-    `max_output_tokens: 50000` 이라 응답까지 수 분이 걸린다. 액션 기본값 60초로는 타임아웃한다
+  * `max_output_tokens: 65535` / `thinking_budget: "12288"` — 사고 토큰도
+    `maxOutputTokens` 예산을 함께 쓴다. 아래 “출력 상한과 2-pass” 참고
+  * `max_time: "600"` / `retry: "3"` — 응답까지 수 분이 걸린다. 액션 기본값 60초로는 타임아웃한다
 * 결과: `steps.llm.outputs.text_file` (본문은 `steps.llm.outputs.text` 로도 나오지만 릴레이에는 쓰지 않는다)
 
-### 8) Append Gemini output to Step Summary
+### 10) Append Gemini output to Step Summary
 
 * `text_file` 경로를 받아 파일을 읽어 Step Summary에 기록
 
-### 9) Create Notion page (draft)
+### 11) Create Notion page (draft)
 
 * DB에서 `data_source_id` resolve
 
@@ -297,7 +364,7 @@ YML 파일을 만들지 않고 **manifest JSON**을 계산해 step output으로 
     모두 만족하도록 재귀로 세어 나눈다
 * output: `steps.notion_draft.outputs.page_id`
 
-### 10) Create & push bundle tag (idempotent + verify)
+### 12) Create & push bundle tag (idempotent + verify)
 
 * tag: `bundle/<releaseKey>`
 * 존재하면:
@@ -308,7 +375,7 @@ YML 파일을 만들지 않고 **manifest JSON**을 계산해 step output으로 
 
   * annotated tag 생성 + push
 
-### 11) Create GitHub Release (generate notes)
+### 13) Create GitHub Release (generate notes)
 
 * `gh release view <tag>`로 존재 여부 확인
 * 없으면 `gh release create <tag> --title ... --generate-notes`
@@ -395,3 +462,27 @@ Argument list too long
 * 에러 로그의 `max_time` / `retry` / `body bytes` 를 확인하고 `max_time` 을 올린다.
 * 소요 시간이 `(1 + retry) * max_time` 에 정확히 맞으면 타임아웃이 확정이다
   (예: `max_time=60 retry=3` → 4분 03초).
+
+### `Gemini response is incomplete: finishReason=MAX_TOKENS`
+
+응답이 중간에 끊겼다는 뜻이다. 로그의 토큰 내역으로 원인이 갈린다.
+
+```
+finishReason=MAX_TOKENS | tokens: prompt=151877 output=3442 thoughts=46554 total=201873
+  | maxOutputTokens=50000 thinkingBudget=<default>
+```
+
+* `thoughts` 가 예산 대부분을 먹었다면 → `thinking_budget` 을 지정해 사고를 묶는다
+* `output` 이 예산을 다 쓰고도 안 끝났다면 → 출력 분량 자체가 많다.
+  `compact_batch_size` 를 줄여 PASS 1 배치를 더 잘게 나눈다
+* PASS 1 배치 하나가 잘리면 로그에 `batch batch_NNN.md: ...` 로 어느 배치인지 나온다
+
+### 릴리즈 노트가 Notion 에서 계층 없이 평면으로 나온다
+
+PASS 2 모델이 프롬프트의 4스페이스 지시 대신 입력(압축본, 2스페이스)을 따라
+2스페이스로 내보낸 경우다. 파서가 출력의 최소 들여쓰기 폭을 감지해 흡수하므로
+지금은 자동 처리되며, 감지값이 로그에 남는다:
+
+```
+release notes indent unit = 2 (observed widths: [2])
+```

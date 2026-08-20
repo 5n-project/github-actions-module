@@ -42,8 +42,29 @@ action input 은 결국 `env` 로 전달되므로 `content` / `system_instructio
 - 작업 파일은 `$RUNNER_TEMP` 하위에 만든다 (미설정 시 `/tmp`)
 
 ### Outputs
-- `text` — 생성 텍스트 본문. `steps.<id>.outputs.text`
+- `text` — 생성 텍스트 본문. `steps.<id>.outputs.text` (배치 모드에서는 비어 있다)
 - `text_file` — 생성 텍스트가 담긴 파일 경로. `steps.<id>.outputs.text_file` (**대용량 권장**)
+- `text_dir` — 배치 모드 출력 디렉토리. 입력 파일과 같은 이름으로 쓰인다
+- `call_count` — 실제 API 호출 횟수
+
+---
+
+## ⚠ 출력 상한 — 사고 토큰이 예산을 함께 쓴다
+
+2.5 계열은 thinking 모델이고 **사고 토큰이 `max_output_tokens` 예산을 함께 소비한다.**
+입력이 크고 지시가 복잡하면 사고가 예산을 다 먹고 본문이 잘린다. 실측:
+
+| thinking_budget | max_output_tokens | 사고 | 본문 | finishReason |
+|---|---|---|---|---|
+| 미지정 | 50,000 | 46,554 | 3,442 | `MAX_TOKENS` |
+| 16,384 | 50,000 | 16,383 | 33,613 | `MAX_TOKENS` |
+| 12,288 | 65,535 | 12,285 | 53,246 | `MAX_TOKENS` |
+
+`finishReason != STOP` 이면 액션이 **실패시킨다.** 잘린 결과가 성공으로 하류에
+흘러가지 않는다. 매 호출 `usageMetadata` 를 로그로 남기므로 원인(사고 vs 본문)이
+바로 갈린다.
+
+출력 상한을 넘길 분량이면 `content_dir` **배치 모드**로 입력을 나눈다.
 
 ---
 
@@ -66,6 +87,29 @@ Gemini API Key (GitHub Secrets로 전달)
 - 지정하면 `content` 를 무시한다
 - 파일이 없으면 `::error::content_file not found: <path>` 로 실패
 - `content` / `content_file` 둘 다 비면 `::error::content is empty.` 로 실패
+
+### `content_dir` (optional, default: `""`)
+**배치 모드.** 이 디렉토리의 파일을 정렬 순서대로 하나씩 **별도 호출**한다.
+
+- 지정하면 `content` / `content_file` 을 무시한다
+- 출력은 `text_dir` 에 **같은 파일명**으로 쓰인다. `text` / `text_file` 은 비어 있다
+- 호출마다 재시도·HTTP/에러 분기·`finishReason` 잘림 가드·`usageMetadata` 로그가
+  단건 모드와 동일하게 적용된다. 로그는 `batch <파일명>:` 접두로 구분된다
+- 한 호출로 출력 상한을 넘기는 분량을 나눠 처리할 때 쓴다.
+  배치 순서가 곧 결과 순서이므로 파일명을 `batch_001`, `batch_002` … 처럼 정렬 가능하게 둔다
+
+```yaml
+- uses: KPNP-R-D/github-actions-module/actions/gemini-generate@gemini-generate/v1
+  id: compact
+  with:
+    api_key: ${{ secrets.GEMINI_API_KEY }}
+    model: gemini-2.5-flash
+    system_instruction_file: ${{ steps.batches.outputs.compact_system_file }}
+    content_dir: ${{ steps.batches.outputs.batch_dir }}
+    max_output_tokens: "65535"
+    thinking_budget: "8192"
+# steps.compact.outputs.text_dir / call_count
+```
 
 ### `temperature` (optional, default: `"0.1"`)
 generationConfig.temperature
