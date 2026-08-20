@@ -1254,25 +1254,65 @@ jobs:
           children.append(divider())
           children.append(toggle_plain("Raw Draft (Data 1)"))
 
-          with open("notion_blocks.json", "w", encoding="utf-8") as f:
-            json.dump({"children": children}, f, ensure_ascii=False)
+          # ---------- Notion append chunking ----------
+          # Notion PATCH /blocks/{id}/children 은 두 가지 상한이 있다.
+          #   1) children 배열 길이 <= 100
+          #   2) 요청에 담긴 "중첩 포함" 전체 블록 수 <= 1000
+          # 최상위 개수만 세면 (2)에 걸린다:
+          #   "Number of blocks in the request exceeds limit of 1000."
+          # 불릿 계층이 깊어질수록 최상위 1개가 수십 블록이 되므로 재귀로 세어 나눈다.
+          MAX_TOP = 95
+          MAX_TOTAL = 900  # 1000 에서 안전 여유
 
-          with open("notion_toggle_children.json", "w", encoding="utf-8") as f:
-            json.dump({"children": draft_blocks if draft_blocks else [paragraph_plain("(empty)")]}, f, ensure_ascii=False)
+          def count_blocks(blk) -> int:
+            n = 1
+            body = blk.get(blk.get("type"), {}) if isinstance(blk, dict) else {}
+            for ch in (body.get("children") or []):
+              n += count_blocks(ch)
+            return n
 
-          print(f"Wrote notion_blocks.json (release_blocks={len(md_blocks)}, draft_blocks={len(draft_blocks)}, total_blocks={len(children)})")
+          def chunk_blocks(blocks):
+            chunks, cur, cur_total = [], [], 0
+            for blk in blocks:
+              c = count_blocks(blk)
+              if cur and (len(cur) >= MAX_TOP or cur_total + c > MAX_TOTAL):
+                chunks.append(cur)
+                cur, cur_total = [], 0
+              if c > MAX_TOTAL:
+                # 단일 블록 하나가 상한을 넘는 경우 (계층이 비정상적으로 깊다)
+                print(f"::warning::single block expands to {c} blocks (> {MAX_TOTAL}); Notion 요청이 실패할 수 있다")
+              cur.append(blk)
+              cur_total += c
+            if cur:
+              chunks.append(cur)
+            return chunks
+
+          def dump_chunks(path, blocks, label):
+            chunks = chunk_blocks(blocks)
+            with open(path, "w", encoding="utf-8") as f:
+              json.dump({"chunks": [{"children": c} for c in chunks]}, f, ensure_ascii=False)
+            sizes = [sum(count_blocks(b) for b in c) for c in chunks]
+            print(f"{label}: top={len(blocks)} total={sum(sizes)} -> {len(chunks)} chunk(s) "
+                  f"top/chunk={[len(c) for c in chunks]} total/chunk={sizes}")
+
+          dump_chunks("notion_blocks.json", children, "notion_blocks.json")
+          dump_chunks(
+            "notion_toggle_children.json",
+            draft_blocks if draft_blocks else [paragraph_plain("(empty)")],
+            "notion_toggle_children.json",
+          )
+
+          print(f"Wrote notion blocks (release_blocks={len(md_blocks)}, draft_blocks={len(draft_blocks)}, top_level={len(children)})")
           PY
 
           # =========================================
-          # 3-1) page blocks append (95개씩 chunk)
+          # 3-1) page blocks append (chunk 단위, 중첩 포함 블록 수 기준)
           # =========================================
-          total=$(jq '.children | length' notion_blocks.json)
-          offset=0
+          total=$(jq '.chunks | length' notion_blocks.json)
+          i=0
 
-          while [ "$offset" -lt "$total" ]; do
-            jq -c --argjson o "$offset" \
-              '{children: (.children[ $o : ($o+95) ])}' \
-              notion_blocks.json > notion_chunk.json
+          while [ "$i" -lt "$total" ]; do
+            jq -c --argjson i "$i" '.chunks[$i]' notion_blocks.json > notion_chunk.json
 
             cres=$(curl -sS -X PATCH "https://api.notion.com/v1/blocks/$pageId/children" \
               -H "Authorization: Bearer $NOTION_TOKEN" \
@@ -1282,12 +1322,13 @@ jobs:
 
             ok=$(echo "$cres" | jq -r 'if .object=="error" then "false" else "true" end')
             if [ "$ok" != "true" ]; then
-              echo "::error::Notion append failed offset=$offset res=$cres"
+              echo "::error::Notion append failed chunk=$((i+1))/$total res=$cres"
               exit 1
             fi
 
-            offset=$((offset+95))
+            i=$((i+1))
           done
+          echo "page blocks appended ($total chunk(s))"
 
           # =========================================
           # 3-2) toggle block id resolve
@@ -1333,15 +1374,13 @@ jobs:
           echo "Resolved toggleId=$toggleId"
 
           # =========================================
-          # 3-3) toggle children append (95개씩 chunk)
+          # 3-3) toggle children append (chunk 단위, 중첩 포함 블록 수 기준)
           # =========================================
-          total=$(jq '.children | length' notion_toggle_children.json)
-          offset=0
+          total=$(jq '.chunks | length' notion_toggle_children.json)
+          i=0
 
-          while [ "$offset" -lt "$total" ]; do
-            jq -c --argjson o "$offset" \
-              '{children: (.children[ $o : ($o+95) ])}' \
-              notion_toggle_children.json > notion_toggle_chunk.json
+          while [ "$i" -lt "$total" ]; do
+            jq -c --argjson i "$i" '.chunks[$i]' notion_toggle_children.json > notion_toggle_chunk.json
 
             cres=$(curl -sS -X PATCH "https://api.notion.com/v1/blocks/$toggleId/children" \
               -H "Authorization: Bearer $NOTION_TOKEN" \
@@ -1351,12 +1390,13 @@ jobs:
 
             ok=$(echo "$cres" | jq -r 'if .object=="error" then "false" else "true" end')
             if [ "$ok" != "true" ]; then
-              echo "::error::Notion toggle append failed offset=$offset res=$cres"
+              echo "::error::Notion toggle append failed chunk=$((i+1))/$total res=$cres"
               exit 1
             fi
 
-            offset=$((offset+95))
+            i=$((i+1))
           done
+          echo "toggle children appended ($total chunk(s))"
 
       - name: Git user config
         run: |

@@ -293,7 +293,8 @@ YML 파일을 만들지 않고 **manifest JSON**을 계산해 step output으로 
   * divider 1개
   * toggle `Raw Draft (Data 1)` 생성
   * toggle children에 데이터1(=draft) append
-  * 95개 chunk로 PATCH (block 제한 회피)
+  * chunk 단위로 PATCH — Notion 상한(children <= 100, **중첩 포함** 전체 블록 <= 1000)을
+    모두 만족하도록 재귀로 세어 나눈다
 * output: `steps.notion_draft.outputs.page_id`
 
 ### 10) Create & push bundle tag (idempotent + verify)
