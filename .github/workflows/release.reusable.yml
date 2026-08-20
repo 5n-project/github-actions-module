@@ -738,12 +738,12 @@ jobs:
           api_key: ${{ secrets.GEMINI_API_KEY }}
           model: gemini-2.5-flash
           temperature: 0.3
-          max_output_tokens: 50000
-          # 사고 토큰도 maxOutputTokens 예산을 함께 쓴다.
-          # 실측(커밋 325개 · prompt 151,877 토큰): 사고 46,554 + 본문 3,442 = 49,996
-          # 으로 예산을 사고가 다 먹고 본문이 MAX_TOKENS 로 잘렸다.
-          # 사고를 묶어 본문 예산 약 33K 토큰을 확보한다.
-          thinking_budget: "16384"
+          # 사고 토큰도 maxOutputTokens 예산을 함께 쓴다. 커밋 325개 실측:
+          #   기본  : 사고 46,554 + 본문  3,442 = 49,996 -> 본문 3,442 토큰에서 잘림
+          #   16384 : 사고 16,383 + 본문 33,613 = 49,996 -> 여전히 잘림(본문 101KB)
+          # 커밋 수에 비례해 본문이 커지므로 모델 출력 상한까지 열고 사고를 묶는다.
+          max_output_tokens: 65535
+          thinking_budget: "12288"
           # 프롬프트가 커밋 로그 전량(150~480KB)이고 출력도 최대 50K 토큰이라
           # 응답까지 수 분이 걸린다. 기본 60초로는 타임아웃한다.
           max_time: "600"
