@@ -27,6 +27,19 @@ inputs:
   max_output_tokens:
     required: false
     default: "2048"
+  max_time:
+    description: >-
+      curl --max-time (초). 요청 1회의 전체 상한.
+      대용량 프롬프트 + 큰 max_output_tokens 조합은 수 분이 걸린다
+      (예: 프롬프트 148KB · max_output_tokens 50000 -> 60초로는 부족).
+    required: false
+    default: "600"
+  retry:
+    description: >-
+      curl --retry 횟수. 타임아웃도 재시도 대상이라 max_time 과 곱해져
+      최악 대기시간이 (1 + retry) * max_time 이 된다.
+    required: false
+    default: "2"
   system_instruction:
     description: >-
       System instruction (inline). content 와 동일하게 128KiB 제약을 받는다.
@@ -58,6 +71,8 @@ runs:
         CONTENT_FILE: ${{ inputs.content_file }}
         TEMPERATURE: ${{ inputs.temperature }}
         MAX_OUTPUT_TOKENS: ${{ inputs.max_output_tokens }}
+        MAX_TIME: ${{ inputs.max_time }}
+        RETRY: ${{ inputs.retry }}
         SYSTEM_INSTRUCTION: ${{ inputs.system_instruction }}
         SYSTEM_INSTRUCTION_FILE: ${{ inputs.system_instruction_file }}
       run: |
@@ -140,11 +155,13 @@ runs:
         # =========
         url="https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent"
 
+        echo "POST ${MODEL} (max_time=${MAX_TIME}s, retry=${RETRY}, body=$(wc -c < "${body_path}") bytes)"
+
         http_code="$(
           curl -sS --fail-with-body \
             --connect-timeout 10 \
-            --max-time 60 \
-            --retry 3 \
+            --max-time "${MAX_TIME}" \
+            --retry "${RETRY}" \
             --retry-delay 1 \
             --retry-all-errors \
             -o "${resp_path}" \
@@ -158,7 +175,7 @@ runs:
 
         # curl 자체 실패(네트워크/timeout 등) -> http_code 비거나 000
         if [ -z "${http_code}" ] || [ "${http_code}" = "000" ]; then
-          echo "::error::HTTP request failed (network/timeout)."
+          echo "::error::HTTP request failed (network/timeout). max_time=${MAX_TIME}s retry=${RETRY} body=$(wc -c < "${body_path}") bytes. 프롬프트나 max_output_tokens 가 크면 max_time 을 늘려야 한다."
           exit 1
         fi
 

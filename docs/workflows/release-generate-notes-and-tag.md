@@ -264,6 +264,8 @@ YML 파일을 만들지 않고 **manifest JSON**을 계산해 step output으로 
 
   * `system_instruction_file = system_file`
   * `content_file = content_file`
+  * `max_time: "600"` / `retry: "1"` — 프롬프트가 약 150KB(≈40K 토큰)이고
+    `max_output_tokens: 50000` 이라 응답까지 수 분이 걸린다. 액션 기본값 60초로는 타임아웃한다
 * 결과: `steps.llm.outputs.text_file` (본문은 `steps.llm.outputs.text` 로도 나오지만 릴레이에는 쓰지 않는다)
 
 ### 8) Append Gemini output to Step Summary
@@ -384,3 +386,11 @@ Argument list too long
 * 해당 값을 `$RUNNER_TEMP` 파일로 옮기고 경로만 넘긴다. 위 “대용량 페이로드 취급(128KiB 한계)” 참고.
 * 호출 측(`current_tags`, catalog `sharedPaths`)으로는 실질적으로 해소되지 않는다 —
   `globalPrevSha` 가 서비스의 직전 태그로 고정되기 때문이다.
+
+### `HTTP request failed (network/timeout).` (Gemini refine)
+
+* 대부분 **curl 타임아웃**이다. draft 가 크면 프롬프트가 약 150KB(≈40K 토큰)까지 가고,
+  `max_output_tokens: 50000` 이라 응답까지 수 분이 걸린다.
+* 에러 로그의 `max_time` / `retry` / `body bytes` 를 확인하고 `max_time` 을 올린다.
+* 소요 시간이 `(1 + retry) * max_time` 에 정확히 맞으면 타임아웃이 확정이다
+  (예: `max_time=60 retry=3` → 4분 03초).

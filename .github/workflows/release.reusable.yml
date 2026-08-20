@@ -739,6 +739,10 @@ jobs:
           model: gemini-2.5-flash
           temperature: 0.3
           max_output_tokens: 50000
+          # 프롬프트가 커밋 로그 전량(약 150KB ≈ 40K 토큰)이고 출력도 최대 50K 토큰이라
+          # 응답까지 수 분이 걸린다. 기본 60초로는 타임아웃한다.
+          max_time: "600"
+          retry: "1"
           system_instruction_file: ${{ steps.prompt.outputs.system_file }}
           content_file: ${{ steps.prompt.outputs.content_file }}
 
