@@ -87,13 +87,16 @@ generationConfig.maxOutputTokens
 - 타임아웃하면 `::error::HTTP request failed (network/timeout).` 로 실패한다.
   로그의 `max_time` / `retry` / `body` bytes 를 보고 올린다
 
-### `retry` (optional, default: `"2"`)
+### `retry` (optional, default: `"3"`)
 `curl --retry` 횟수.
 
-- `--retry-all-errors` 이므로 **타임아웃도 재시도 대상**이다.
-  최악 대기시간이 `(1 + retry) * max_time` 으로 곱해진다
-- 느려서 타임아웃하는 경우 재시도는 도움이 안 되므로,
-  `max_time` 을 충분히 주고 `retry` 는 낮게 두는 편이 낫다
+- `--retry-all-errors` 이므로 **타임아웃과 5xx 모두 재시도 대상**이다.
+  실제로 Gemini `503 UNAVAILABLE`("This model is currently experiencing high demand") 이 관측된다
+- `--retry-delay` 를 주지 않아 curl 기본 **지수 백오프**(1s, 2s, 4s ...)로 동작한다.
+  503 과부하는 고정 1초 간격 재시도로는 잘 안 풀린다
+- `--retry-max-time ${max_time}` 으로 재시도 시작 창이 묶여, `retry` 값과 무관하게
+  최악 대기시간은 `2 * max_time` 이다
+- 단, **느려서 타임아웃하는 경우 재시도는 도움이 안 된다** — 그 경우엔 `max_time` 을 올려야 한다
 
 ### `system_instruction` (optional, default: `""`)
 system instruction 텍스트, inline 전달.
@@ -148,7 +151,9 @@ body 는 `jq --rawfile` 로 **파일에서 직접** 읽어 `$RUNNER_TEMP/gemini_
 
 ### 2) 네트워크 / HTTP
 
-`curl` 은 `--connect-timeout 10 --max-time ${max_time} --retry ${retry} --retry-delay 1 --retry-all-errors` 로 호출한다.
+`curl` 은 `--connect-timeout 10 --max-time ${max_time} --retry ${retry} --retry-max-time ${max_time} --retry-all-errors` 로 호출한다.
+`--retry-delay` 를 주지 않아 curl 기본 **지수 백오프**(1s, 2s, 4s ...)가 동작하고,
+`--retry-max-time` 이 재시도 시작 창을 묶어 최악 대기시간은 `2 * max_time` 이다.
 
 * curl 자체 실패(`http_code` 가 비거나 `000`) → `::error::HTTP request failed (network/timeout).`
 * 2xx 아님 → `::error::HTTP <code> from Gemini API. Body: <응답 앞 2000 bytes>`
@@ -222,7 +227,7 @@ DELIM="__EOF_$(date +%s%N)__"
     temperature: "0.3"
     max_output_tokens: "50000"
     max_time: "600"   # 150KB 프롬프트 + 50K 출력 토큰은 60초로 부족
-    retry: "1"
+    retry: "3"
 ```
 
 결과 사용 — **본문을 env 로 넘기지 말고 경로를 넘긴다**:

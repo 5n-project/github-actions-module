@@ -264,7 +264,7 @@ YML 파일을 만들지 않고 **manifest JSON**을 계산해 step output으로 
 
   * `system_instruction_file = system_file`
   * `content_file = content_file`
-  * `max_time: "600"` / `retry: "1"` — 프롬프트가 약 150KB(≈40K 토큰)이고
+  * `max_time: "600"` / `retry: "3"` — 프롬프트가 약 150KB(≈40K 토큰)이고
     `max_output_tokens: 50000` 이라 응답까지 수 분이 걸린다. 액션 기본값 60초로는 타임아웃한다
 * 결과: `steps.llm.outputs.text_file` (본문은 `steps.llm.outputs.text` 로도 나오지만 릴레이에는 쓰지 않는다)
 

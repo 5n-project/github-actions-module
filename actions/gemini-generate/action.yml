@@ -36,10 +36,11 @@ inputs:
     default: "600"
   retry:
     description: >-
-      curl --retry 횟수. 타임아웃도 재시도 대상이라 max_time 과 곱해져
-      최악 대기시간이 (1 + retry) * max_time 이 된다.
+      curl --retry 횟수. 503 UNAVAILABLE(모델 과부하) 같은 일시 장애 대비.
+      --retry-delay 를 주지 않아 curl 기본 지수 백오프(1s, 2s, 4s ...)로 동작하고,
+      --retry-max-time 을 max_time 으로 묶어 최악 대기시간을 2 * max_time 으로 제한한다.
     required: false
-    default: "2"
+    default: "3"
   system_instruction:
     description: >-
       System instruction (inline). content 와 동일하게 128KiB 제약을 받는다.
@@ -157,12 +158,15 @@ runs:
 
         echo "POST ${MODEL} (max_time=${MAX_TIME}s, retry=${RETRY}, body=$(wc -c < "${body_path}") bytes)"
 
+        # --retry-delay 를 주지 않아야 curl 기본 지수 백오프(1s, 2s, 4s ...)가 동작한다.
+        # 503 UNAVAILABLE(모델 과부하)는 고정 1초 간격 재시도로는 잘 안 풀린다.
+        # --retry-max-time 은 "새 재시도를 시작할 수 있는 창"이라 최악 대기는 2 * max_time 이다.
         http_code="$(
           curl -sS --fail-with-body \
             --connect-timeout 10 \
             --max-time "${MAX_TIME}" \
             --retry "${RETRY}" \
-            --retry-delay 1 \
+            --retry-max-time "${MAX_TIME}" \
             --retry-all-errors \
             -o "${resp_path}" \
             -w "%{http_code}" \
