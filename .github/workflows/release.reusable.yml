@@ -1288,7 +1288,51 @@ jobs:
               chunks.append(cur)
             return chunks
 
+          # ---------- Notion nesting depth ----------
+          # 요청 1건에 담을 수 있는 중첩은 children 2단까지다 (레벨 0/1/2).
+          # 레벨 2 블록이 children 을 가지면 400 이 난다:
+          #   body.children[i]...children[k].bulleted_list_item.children should be not present
+          # build_draft 는 MAX_DEPTH=3 이라 커밋 제목(레벨 0) + 본문 3단 = 레벨 3 이 생긴다.
+          # 레벨 2를 넘는 자손은 레벨 2 형제로 승격해 평탄화한다 (본문 유실 없음, 들여쓰기만 손실).
+          NOTION_MAX_LEVEL = 2
+          flattened = 0
+
+          def _take_children(blk):
+            body = blk.get(blk.get("type"), {})
+            return body.pop("children", None) or []
+
+          def _set_children(blk, kids):
+            body = blk.get(blk.get("type"), {})
+            if kids:
+              body["children"] = kids
+            else:
+              body.pop("children", None)
+
+          def clamp_nesting(blocks, level=0):
+            global flattened
+            out = []
+            for blk in blocks:
+              kids = _take_children(blk)
+              out.append(blk)
+              if level < NOTION_MAX_LEVEL:
+                _set_children(blk, clamp_nesting(kids, level + 1))
+                continue
+              # 레벨 2 블록은 children 을 가질 수 없다 -> 자손 전체를 형제로 (깊이 우선, 순서 유지)
+              stack = list(kids)
+              while stack:
+                b = stack.pop(0)
+                sub = _take_children(b)
+                out.append(b)
+                flattened += 1
+                stack = sub + stack
+            return out
+
           def dump_chunks(path, blocks, label):
+            global flattened
+            before = flattened
+            blocks = clamp_nesting(blocks)
+            if flattened > before:
+              print(f"{label}: Notion 중첩 상한(레벨 {NOTION_MAX_LEVEL})을 넘는 블록 {flattened - before}개를 평탄화")
             chunks = chunk_blocks(blocks)
             with open(path, "w", encoding="utf-8") as f:
               json.dump({"chunks": [{"children": c} for c in chunks]}, f, ensure_ascii=False)
